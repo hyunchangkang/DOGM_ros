@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Launch arguments -->
+    <arg name="lidar_topic" default="/scan" />
+    <arg name="rviz" default="true" />
+
+    <!-- Load parameters -->
+    <rosparam file="$(find dogm_ros)/config/params.yaml" command="load" />
+
+    <!-- DOGM Node -->
+    <node name="dogm_node" pkg="dogm_ros" type="dogm_node" output="screen">
+        <!-- Remap the scan topic to the provided argument -->
+        <remap from="/scan" to="$(arg lidar_topic)" />
+    </node>
+
+    <!-- Optional: RViz for visualization -->
+    <node if="$(arg rviz)" name="rviz" pkg="rviz" type="rviz" 
+          args="-d $(find dogm_ros)/rviz/dogm.rviz" />
+</launch>
