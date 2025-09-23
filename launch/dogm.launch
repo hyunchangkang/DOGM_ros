@@ -13,7 +13,7 @@
         <remap from="/scan" to="$(arg lidar_topic)" />
     </node>
 
-    <!-- Optional: RViz for visualization -->
+    <!-- Optional: RViz for visualization -->`
     <node if="$(arg rviz)" name="rviz" pkg="rviz" type="rviz" 
           args="-d $(find dogm_ros)/rviz/dogm.rviz" />
           

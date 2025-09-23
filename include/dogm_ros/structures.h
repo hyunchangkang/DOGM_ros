@@ -136,6 +136,31 @@
 #define DOGM_ROS_STRUCTURES_H
 
 #include <cstdint>
+#include <pcl/point_types.h>
+#include <pcl/point_cloud.h>
+
+struct mmWaveCloudType
+{
+    PCL_ADD_POINT4D;
+    union
+    {
+        struct
+        {
+            float intensity; // SNR 값 저장용
+            float velocity;
+        };
+        float data_c[4];
+    };
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(mmWaveCloudType,
+    (float, x, x)
+    (float, y, y)
+    (float, z, z)
+    (float, intensity, intensity)
+    (float, velocity, velocity)
+)
 
 struct Particle {
     double x{0.0}, y{0.0};
@@ -164,6 +189,10 @@ struct GridCell {
     // 히스테리시스용 연속 프레임 카운트
     std::uint8_t dyn_streak{0};
     std::uint8_t stat_streak{0};
+    // Radar 힌트 저장을 위한 변수 추가
+    bool   is_dynamic_by_radar{false};
+    double radar_vx{0.0};
+    double radar_vy{0.0};
 };
 
 struct MeasurementCell {

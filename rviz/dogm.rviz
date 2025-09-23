@@ -62,7 +62,8 @@ Visualization Manager:
       Axis: Z
       Channel Name: intensity
       Class: rviz/LaserScan
-      Color: 255; 0; 0
+      Color: 76; 250; 208
+      # [핵심 수정 2] 모든 포인트에 위에서 지정한 단일 색상을 적용하도록 변경
       Color Transformer: FlatColor
       Decay Time: 0
       Enabled: true

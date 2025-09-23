@@ -1,5 +1,6 @@
 # 1. ROS 토픽 및 좌표계 설정
 lidar_topic: "/scan"
+radar_topic: "/ti_mmwave/radar_scan_pcl_0" 
 grid_topic: "/dogm/grid"
 marker_topic: "/dogm/markers"
 base_frame: "base_link"
