@@ -169,6 +169,13 @@ struct Particle {
     int    grid_cell_idx{-1};
     int    age{0}; // [추가] 파티클의 나이 (프레임 단위)
 };
+// 최근 Radar 포인트 정보를 저장하기 위한 구조체
+struct RadarPoint
+{
+    double vx;
+    double vy;
+    int age; // 포인트가 추가된 후 지난 프레임 수
+};
 
 struct GridCell {
     // DS-PHD/MIB 질량
@@ -189,10 +196,10 @@ struct GridCell {
     // 히스테리시스용 연속 프레임 카운트
     std::uint8_t dyn_streak{0};
     std::uint8_t stat_streak{0};
-    // Radar 힌트 저장을 위한 변수 추가
-    bool   is_dynamic_by_radar{false};
-    double radar_vx{0.0};
-    double radar_vy{0.0};
+    double radar_vx{0.0};         // 해당 셀의 평균 Radar x축 속도
+    double radar_vy{0.0};         // 해당 셀의 평균 Radar y축 속도
+    bool has_reliable_radar{false};
+    std::vector<RadarPoint> radar_points_buffer;
 };
 
 struct MeasurementCell {

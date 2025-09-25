@@ -5,13 +5,13 @@ grid_topic: "/dogm/grid"
 marker_topic: "/dogm/markers"
 base_frame: "base_link"
 
-# 2. 그리드 맵 및 필터 설정
-grid_size: 3.0
+#그리드 크기
+grid_size: 3.0 
 grid_resolution: 0.15
-filter_update_rate: 10.0
+filter_update_rate: 15.0
 
 # 3. 파티클 필터 및 프로세스 모델
-max_velocity: 1.0
+max_velocity: 1.5
 num_particles: 20000
 process_noise_pos: 0.03
 # [핵심 수정] 속도 노이즈를 대폭 줄여 정적 파티클의 불필요한 움직임을 최소화합니다.
@@ -24,8 +24,9 @@ birth_prob: 0.02
 # [핵심 수정] 새로 생성되는 정적 가설 파티클의 초기 속도 분산을 매우 작게 하여,
 # 처음부터 안정적인 정적 상태를 유지하도록 합니다.
 newborn_vel_stddev: 1.0
-dynamic_birth_ratio: 0.5
-dynamic_newborn_vel_stddev: 3.5
+dynamic_birth_ratio: 0.1
+dynamic_newborn_vel_stddev: 0.5
+radar_newborn_vel_stddev: 0.3
 
 # 5. 속도 감쇠 및 동적/정적 분류
 velocity_damping_threshold: 0.6
@@ -40,3 +41,8 @@ max_velocity_for_scaling: 1.5
 show_velocity_arrows: true
 use_ego_comp: true
 odom_topic: "/odom"
+
+# radar_buffer_size: 각 셀이 Radar 포인트를 기억할 최대 프레임 수. (10프레임 = 20Hz에서 0.5초)
+radar_buffer_size: 4
+# min_radar_points: 셀의 평균 Radar 속도를 신뢰하기 위해 필요한 최소 포인트 개수.
+min_radar_points: 3
