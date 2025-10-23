@@ -12,13 +12,19 @@ public:
     ParticleFilter(int num_particles, double process_noise_pos, double process_noise_vel);
     ~ParticleFilter() = default;
 
-    // [수정] 최대 속도 제한(max_vel) 파라미터를 인자로 받도록 변경
     void predict(double dt, double survival_prob,
                  double damping_thresh, double damping_factor,
                  double max_vel);
 
-    // [수정] 측정 그리드 전체를 인자로 받도록 변경
-    void updateWeights(const std::vector<MeasurementCell>& measurement_grid);
+    /**
+     * @brief [MODIFIED] Updates particle weights based on BOTH LiDAR and Radar.
+     * @param measurement_grid LiDAR occupancy measurements (m_occ_z, m_free_z)
+     * @param grid The full GridCell vector containing Radar hints (vr_hint, theta_hint)
+     * @param radar_noise_stddev Standard deviation of radar velocity noise (for Gaussian PDF)
+     */
+    void updateWeights(const std::vector<MeasurementCell>& measurement_grid,
+                       const std::vector<GridCell>& grid,
+                       double radar_noise_stddev);
 
     void sortParticlesByGridCell(const DynamicGridMap& grid_map);
     void resample(const std::vector<Particle>& new_born_particles);

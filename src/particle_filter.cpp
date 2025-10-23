@@ -19,7 +19,7 @@ ParticleFilter::ParticleFilter(int num_particles, double process_noise_pos, doub
     }
 }
 
-// [종합 수정] 최대 속도 제한 및 age 기반 감쇠 로직이 적용된 최종 predict 함수
+// predict (기존과 동일)
 void ParticleFilter::predict(double dt, double survival_prob,
                              double damping_thresh, double damping_factor,
                              double max_vel)
@@ -52,24 +52,59 @@ void ParticleFilter::predict(double dt, double survival_prob,
     }
 }
 
-void ParticleFilter::updateWeights(const std::vector<MeasurementCell>& measurement_grid)
+/**
+ * @brief [MODIFIED] Updates weights using both LiDAR (occupancy) and Radar (range_rate).
+ */
+void ParticleFilter::updateWeights(const std::vector<MeasurementCell>& measurement_grid,
+                                   const std::vector<GridCell>& grid,
+                                   double radar_noise_stddev)
 {
     double total_weight = 0.0;
+    const double radar_variance = radar_noise_stddev * radar_noise_stddev;
+    // Pre-calculate 1.0 / (sigma * sqrt(2*pi)) for Gaussian PDF normalization
+    // We can skip normalization if we only care about relative weights.
+    // Let's just use the exponential part for speed.
+    const double radar_norm_factor = -0.5 / std::max(1e-9, radar_variance);
+
     for (auto& p : particles_)
     {
         if (p.grid_cell_idx >= 0 && p.grid_cell_idx < measurement_grid.size())
         {
+            // 1. LiDAR Likelihood (Geometric verification)
             const auto& meas_cell = measurement_grid[p.grid_cell_idx];
-            double likelihood = 0.05 + 0.95 * (meas_cell.m_occ_z * meas_cell.m_occ_z);
-            p.weight *= likelihood;
+            double lidar_likelihood = 0.05 + 0.95 * (meas_cell.m_occ_z * meas_cell.m_occ_z);
+
+            // 2. Radar Likelihood (Kinematic verification)
+            double radar_likelihood = 1.0; // Default: no influence
+            const auto& grid_cell = grid[p.grid_cell_idx];
+
+            if (grid_cell.has_reliable_radar)
+            {
+                // Project particle's 2D velocity (vx, vy) onto Radar's 1D direction (theta)
+                const double theta_hint = grid_cell.radar_theta_hint;
+                const double vr_guess = p.vx * std::cos(theta_hint) + p.vy * std::sin(theta_hint);
+                
+                // Compare particle's 1D guess (vr_guess) with radar's 1D measurement (vr_hint)
+                const double vr_hint = grid_cell.radar_vr_hint;
+                const double error = vr_guess - vr_hint;
+
+                // Calculate likelihood using Gaussian PDF (unnormalized)
+                radar_likelihood = std::exp(error * error * radar_norm_factor);
+            }
+
+            // 3. Combine Likelihoods
+            // (0,0) particles will get lidar_likelihood=high, radar_likelihood=low -> weight=low
+            // (vx,vy) particles will get lidar_likelihood=high, radar_likelihood=high -> weight=high
+            p.weight *= (lidar_likelihood * radar_likelihood);
         }
         else
         {
-            p.weight *= 0.01;
+            p.weight *= 0.01; // Particle is outside the grid
         }
         total_weight += p.weight;
     }
 
+    // Normalize total weights
     if (total_weight > 1e-9)
     {
         for (auto& p : particles_)
@@ -80,6 +115,7 @@ void ParticleFilter::updateWeights(const std::vector<MeasurementCell>& measureme
 }
 
 
+// sortParticlesByGridCell (기존과 동일)
 void ParticleFilter::sortParticlesByGridCell(const DynamicGridMap& grid_map)
 {
     for (auto& p : particles_)
@@ -101,6 +137,7 @@ void ParticleFilter::sortParticlesByGridCell(const DynamicGridMap& grid_map)
               });
 }
 
+// resample (기존과 동일)
 void ParticleFilter::resample(const std::vector<Particle>& new_born_particles)
 {
     std::vector<Particle> combined_pool;
