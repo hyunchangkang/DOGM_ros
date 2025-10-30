@@ -1,69 +1,122 @@
 # ===================================================================
-# dogm_ros 파라미터 설정 파일 (최종 정리 버전)
+# dogm_ros parameter file (Annotated Version)
 # ===================================================================
 
-# 1. ROS 토픽 및 좌표계 설정
+# 1. ROS Topics & Coordinate Frames
 # -------------------------------------------------------------------
-lidar_topic: "/scan"
-radar_topic: "/ti_mmwave/radar_scan_pcl_0"
-grid_topic: "/dogm/grid"
-marker_topic: "/dogm/markers"
-base_frame: "base_link"
-odom_topic: "/odom"
+lidar_topic: "/scan"                     # Topic for sensor_msgs/LaserScan
+radar_topic: "/ti_mmwave/radar_scan_pcl_0" # Topic for sensor_msgs/PointCloud2 (mmWaveCloudType)
+grid_topic: "/dogm/grid"                 # Topic for nav_msgs/OccupancyGrid output
+marker_topic: "/dogm/markers"            # Topic for visualization_msgs/MarkerArray (cells and arrows)
+base_frame: "base_link"                  # Robot's base frame (for calculating grid position)
+odom_topic: "/odom"                      # Topic for nav_msgs/Odometry (for ego-motion compensation)
 
-# 2. 그리드 맵 및 필터 기본 설정
+# 2. Grid Map & Filter Base Settings
 # -------------------------------------------------------------------
-grid_size: 3.0
-grid_resolution: 0.15
-filter_update_rate: 10.0
+grid_size: 3.0                           # Total width/height of the square grid map (meters)
+grid_resolution: 0.10                    # Size of a single grid cell (meters)
+filter_update_rate: 10.0                  # Main filter loop frequency (Hz)
 
-# 3. 파티클 필터 및 프로세스 모델 (알고리즘 핵심)
+# [NEW] Minimum LiDAR hits in a cell to *start* calculating occupancy mass.
+# Prevents stray points (noise) from creating occupied cells.
+#
+lidar_point_counts: 5
+
+# 3. Particle Filter & Process Model (Core Algorithm)
 # -------------------------------------------------------------------
-num_particles: 20000
-max_velocity: 1.5
-process_noise_pos: 0.03
-process_noise_vel: 0.1
+num_particles: 5000                     # Total number of particles used by the filter
+max_velocity: 1.5                        # Maximum speed a particle can have (m/s)
+process_noise_pos: 0.03                  # Stddev for position "random walk" in predict step (m)
+process_noise_vel: 0.05                  # Stddev for velocity "random walk" in predict step (m/s)
+
+# Probability that a particle survives to the next time step.
+#
 persistence_prob: 0.99
+
+# Probability of a new object "birthing" in a previously unknown cell.
+# Used in updateOccupancy to calculate newborn mass 'rho_b'.
+#
 birth_prob: 0.02
 
-# 4. 신규 파티클 생성 관련 설정
+# 4. New Particle Generation (The part we discussed)
 # -------------------------------------------------------------------
+# Stddev for velocity of *static* newborn particles. (Should be low, centered at 0)
+#
 newborn_vel_stddev: 0.3
+
+# Stddev for velocity of *dynamic* newborn particles. (Should be high, for diverse speed guesses)
+#
 dynamic_newborn_vel_stddev: 1.5
 
-# 5. 속도 감쇠 및 동적/정적 분류
+# 5. Velocity Damping & Classification
 # -------------------------------------------------------------------
-velocity_damping_threshold: 0.6
-velocity_damping_factor: 0.2
-static_velocity_threshold: 0.1
+# If a particle's speed drops below this, it gets artificially slowed down.
+# Helps remove dynamic particles from objects that have stopped.
+#
+velocity_damping_threshold: 0.2
+velocity_damping_factor: 0.2             # How much to slow down (0.2 = 80% reduction)
 
-# 6. Radar 센서 퓨전 관련 설정
+# The FINAL threshold. If a cell's average particle speed is above this,
+# 'has_speed_from_particles' becomes true.
+#
+static_velocity_threshold: 0.2
+
+# 6. Radar Sensor Fusion (Key parameters)
 # -------------------------------------------------------------------
-use_radar: true
-# 6a. Radar 힌트 생성 관련
+use_radar: true                         # Master toggle for all radar fusion logic
+
+# 6a. Radar Hint Generation (Temporal & Spatial Smoothing)
+# How many frames a radar point is kept in a cell's buffer.
+#
 radar_buffer_size: 5
-min_radar_points: 2
-radar_hint_search_radius: 3
+# Minimum points needed in the buffer to create a reliable 'radar_vr_hint'.
+#
+min_radar_points: 3
+
+# Radius for *spatial* smoothing (borrowing hints from neighbors).
+# 3 means it checks a 7x7 (49-cell) area around the target cell.
+#
+radar_hint_search_radius: 2 
+
+# --- Birth Ratio Scaling (Your Question) ---
+# Default ratio of dynamic particles if NO RADAR HINT is found. (e.g., 10%)
+# This implies "Assume Static" philosophy.
+#
 min_dynamic_birth_ratio: 0.1
+
+# Maximum ratio of dynamic particles if a STRONG RADAR HINT is found. (e.g., 90%)
+#
 max_dynamic_birth_ratio: 0.9
-max_radar_speed_for_scaling: 1.0
-# 6b. [신규] Radar 가중치 갱신 (핵심 개선)
-# 파티클 가설 검증 시 사용할 레이다 range_rate의 노이즈 표준편차 (m/s)
-radar_noise_stddev: 0.25
-# 6c. [신규] 안전망 1: Measurement Correction (측면 이동 보정)
-# 파티클이 이미 '동적'일 때, 레이다가 '정적'(vr=0)으로 측정해도 파티클을 신뢰할지 여부
+
+# The radar speed (m/s) at which the ratio scales to the maximum.
+# (e.g., speed=0.5 -> 50% scale, speed=1.0 -> 100% scale -> 90% dynamic ratio)
+#
+max_radar_speed_for_scaling: 1.0 
+
+# 6b. Radar Weight Update (in particle_filter.cpp)
+# The 'stddev' (size of the "trust zone") for the 'radar_likelihood'.
+# Smaller = stricter, particle speed must match radar speed exactly.
+# Larger = looser, allows for more error.
+#
+radar_noise_stddev: 0.4
+
+# 6c. Safety Net 1: Measurement Correction (Handles crossing objects)
+# If particles show speed but radar shows 0 (crossing object),
+# this forces a 'dynamic' classification.
+#
 use_measurement_correction: true
-# 6d. [신규] 안전망 2: False Static Detection (느린 보행자 보정)
-# '빈 공간'이었던 셀이 '정적'으로 바뀌었을 때 '동적'으로 강제 변경할지 여부
+
+# 6d. Safety Net 2: False Static Detection (Handles slow walkers)
+# If an object is 'static' for 'fsd_T_static' frames but was 'free'
+# 'fsd_T_free' frames before that, it's likely a slow-starting
+# dynamic object. Force dynamic classification.
+#
 use_false_static_detection: true
-# '정적'으로 간주되기 시작하는 최소 프레임 수
-fsd_T_static: 4
-# '빈 공간'으로 간주되기 위한 최소 프레임 수
-fsd_T_free: 10
+fsd_T_static: 2 
+fsd_T_free: 5   
 
-
-# 7. 기타 부가 기능 설정
+# 7. Misc / Visualization
 # -------------------------------------------------------------------
-show_velocity_arrows: true
-use_ego_comp: true
-max_velocity_for_scaling: 2.0
+show_velocity_arrows: true               # Toggle for RViz velocity markers
+use_ego_comp: true                       # Compensate for robot's own movement
+max_velocity_for_scaling: 2.0            # Max speed for coloring RViz markers
