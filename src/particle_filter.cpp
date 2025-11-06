@@ -1,5 +1,5 @@
 #include "dogm_ros/particle_filter.h"
-#include "dogm_ros/dynamic_grid_map.h"
+#include "dogm_ros/dynamic_grid_map.h" // Needed for getSmoothedRadarVrHint
 #include <algorithm>
 #include <numeric>
 #include <cmath>
@@ -53,48 +53,67 @@ void ParticleFilter::predict(double dt, double survival_prob,
 }
 
 /**
- * @brief [MODIFIED] Updates weights using both LiDAR (occupancy) and Radar (range_rate).
+ * @brief [MODIFIED] Updates weights using Lidar Likelihood Field and
+ * Spatially-Smoothed Radar + Static Assumption.
  */
 void ParticleFilter::updateWeights(const std::vector<MeasurementCell>& measurement_grid,
                                    const std::vector<GridCell>& grid,
-                                   double radar_noise_stddev)
+                                   const DynamicGridMap& grid_map, // [NEW]
+                                   double radar_noise_stddev,
+                                   double radar_static_penalty_strength) // [MODIFIED] Renamed
 {
     double total_weight = 0.0;
     const double radar_variance = radar_noise_stddev * radar_noise_stddev;
-    // Pre-calculate 1.0 / (sigma * sqrt(2*pi)) for Gaussian PDF normalization
-    // We can skip normalization if we only care about relative weights.
-    // Let's just use the exponential part for speed.
     const double radar_norm_factor = -0.5 / std::max(1e-9, radar_variance);
+
+    // [MODIFIED] Pre-calculate the NEGATIVE penalty factor
+    // The input 'radar_static_penalty_strength' is positive (e.g., 0.5)
+    // We need 'C_static' to be negative (e.g., -0.5)
+    const double C_static = -radar_static_penalty_strength;
 
     for (auto& p : particles_)
     {
         if (p.grid_cell_idx >= 0 && p.grid_cell_idx < measurement_grid.size())
         {
             // 1. LiDAR Likelihood (Geometric verification)
+            // [MODIFIED] Use Likelihood Field value directly.
             const auto& meas_cell = measurement_grid[p.grid_cell_idx];
-            double lidar_likelihood = 0.05 + 0.95 * (meas_cell.m_occ_z * meas_cell.m_occ_z);
+            double lidar_likelihood = std::max(1e-9, meas_cell.m_occ_z);
 
             // 2. Radar Likelihood (Kinematic verification)
             double radar_likelihood = 1.0; // Default: no influence
             const auto& grid_cell = grid[p.grid_cell_idx];
 
-            if (grid_cell.has_reliable_radar)
-            {
-                // Project particle's 2D velocity (vx, vy) onto Radar's 1D direction (theta)
-                const double theta_hint = grid_cell.radar_theta_hint;
-                const double vr_guess = p.vx * std::cos(theta_hint) + p.vy * std::sin(theta_hint);
-                
-                // Compare particle's 1D guess (vr_guess) with radar's 1D measurement (vr_hint)
-                const double vr_hint = grid_cell.radar_vr_hint;
-                const double error = vr_guess - vr_hint;
+            // --- [MODIFIED] Inaccuracy & Sparsity Fix ---
+            double vr_hint = 0.0;
+            double theta_hint = 0.0; 
+            bool has_hint = false;
 
-                // Calculate likelihood using Gaussian PDF (unnormalized)
-                radar_likelihood = std::exp(error * error * radar_norm_factor);
+            // Note: Inaccuracy fix (neighbor search) is now handled
+            // in calculateVelocityStatistics.
+            // This updateWeights step only handles Sparsity (local hint or static).
+            has_hint = grid_cell.has_reliable_radar;
+            if(has_hint) {
+                vr_hint = grid_cell.radar_vr_hint;
+                theta_hint = grid_cell.radar_theta_hint;
             }
 
+            if (has_hint) // [Case 1] Radar hint exists
+            {
+                const double vr_guess = p.vx * std::cos(theta_hint) + p.vy * std::sin(theta_hint);
+                const double error = vr_guess - vr_hint;
+                radar_likelihood = std::exp(error * error * radar_norm_factor);
+            }
+            else // [Case 2] No Radar hint (Sparsity fix)
+            {
+                // [MODIFIED] Use the pre-calculated NEGATIVE C_static
+                const double speed_sq = p.vx * p.vx + p.vy * p.vy; 
+                radar_likelihood = std::exp(speed_sq * C_static);
+            }
+            // --- [END MODIFICATION] ---
+
+
             // 3. Combine Likelihoods
-            // (0,0) particles will get lidar_likelihood=high, radar_likelihood=low -> weight=low
-            // (vx,vy) particles will get lidar_likelihood=high, radar_likelihood=high -> weight=high
             p.weight *= (lidar_likelihood * radar_likelihood);
         }
         else

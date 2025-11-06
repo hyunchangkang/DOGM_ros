@@ -1,3 +1,4 @@
+// Test comment: This is a placeholder comment added for testing purposes.
 #include "dogm_ros/radar_velocity_viz.h" // Include the header file we just created
 
 // Function to interpolate color based on velocity magnitude using a rainbow spectrum

@@ -1,10 +1,8 @@
 // dogm_ros/src/dynamic_grid_map.cpp
 // Contains all modifications for:
-// 1. Reduced 'm_free_z' accumulation (for flickering)
+// 1. [NEW] Likelihood Field generation (L_lidar)
 // 2. Branched 'generateNewParticles' logic (for LiDAR-Only)
-// 3. [NEW] Branched 'calculateVelocityStatistics' logic (for LiDAR-Only)
-// 4. [NEW] Using 'getSmoothedRadarVrHint' for 'has_speed_from_radar'
-// 5. [NEW] Changed final check from AND to OR
+// 3. [MODIFIED] 'calculateVelocityStatistics' logic (OR logic + Smoothed Radar)
 
 #include "dogm_ros/dynamic_grid_map.h"
 #include <algorithm>
@@ -13,7 +11,8 @@
 #include <vector>
 #include <random>
 
-// Constructor (no changes)
+
+// Constructor (MODIFIED)
 DynamicGridMap::DynamicGridMap(double grid_size, double resolution, int num_particles,
                                double process_noise_pos, double process_noise_vel,
                                int radar_buffer_size, int min_radar_points,
@@ -21,7 +20,8 @@ DynamicGridMap::DynamicGridMap(double grid_size, double resolution, int num_part
                                bool use_fsd, int fsd_T_static, int fsd_T_free,
                                bool use_mc,
                                bool use_radar,
-                               int lidar_point_counts)
+                               int lidar_hit_point,      // [MODIFIED]
+                               double lidar_noise_stddev) // [NEW]
     : grid_size_(grid_size),
       resolution_(resolution),
       radar_buffer_size_(radar_buffer_size),
@@ -32,7 +32,8 @@ DynamicGridMap::DynamicGridMap(double grid_size, double resolution, int num_part
       fsd_T_free_(fsd_T_free),
       use_mc_(use_mc),
       use_radar_(use_radar),
-      lidar_point_counts_(lidar_point_counts),
+      lidar_hit_point_(lidar_hit_point),         // [MODIFIED]
+      lidar_noise_stddev_(lidar_noise_stddev), // [NEW]
       random_generator_(std::mt19937(std::random_device()()))
 {
     grid_width_  = static_cast<int>(std::round(grid_size_ / resolution_));
@@ -46,7 +47,7 @@ DynamicGridMap::DynamicGridMap(double grid_size, double resolution, int num_part
     );
 }
 
-// Basic grid conversion functions (no changes)
+// Basic grid conversion functions (no changes, but indexToGrid added)
 bool DynamicGridMap::isInside(int gx, int gy) const
 {
     return (gx >= 0 && gx < grid_width_ && gy >= 0 && gy < grid_height_);
@@ -56,6 +57,14 @@ int DynamicGridMap::gridToIndex(int gx, int gy) const
 {
     return gy * grid_width_ + gx;
 }
+
+// [NEW] Helper function
+void DynamicGridMap::indexToGrid(int idx, int& gx, int& gy) const
+{
+    gy = idx / grid_width_;
+    gx = idx % grid_width_;
+}
+
 
 bool DynamicGridMap::worldToGrid(double wx, double wy, int& gx, int& gy) const
 {
@@ -70,7 +79,7 @@ void DynamicGridMap::gridToWorld(int gx, int gy, double& wx, double& wy) const
     wy = origin_y_ + (static_cast<double>(gy) + 0.5) * resolution_;
 }
 
-// generateMeasurementGrid (flickering fix included)
+// generateMeasurementGrid (MODIFIED: Lidar Likelihood Field)
 void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::ConstPtr& scan, const pcl::PointCloud<mmWaveCloudType>::ConstPtr& radar_cloud)
 {
     // 1. Initialize measurement grid and age/filter Radar buffer
@@ -163,14 +172,50 @@ void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::Const
         // --- End Hit Counting ---
     }
 
-    // --- Calculate Occupied Mass based on Hit Counts ---
-    for (size_t i = 0; i < hit_counts.size(); ++i) {
-        if (hit_counts[i] > lidar_point_counts_) {
-            double confidence = 1.0 - std::pow(0.4, hit_counts[i]);
-            measurement_grid_[i].m_occ_z = std::min(1.0, confidence);
+    // --- [MODIFIED] Calculate Lidar Likelihood Field (m_occ_z) ---
+    // (Replaces the old hit_counts -> m_occ_z logic)
+
+    // Pre-calculate Gaussian constant (C)
+    const double lidar_variance = lidar_noise_stddev_ * lidar_noise_stddev_;
+    const double lidar_norm_factor = -0.5 / std::max(1e-9, lidar_variance); // This is 'C'
+
+    // Determine search radius (e.g., 3-sigma)
+    const int search_radius = static_cast<int>(std::ceil(3.0 * lidar_noise_stddev_ / resolution_));
+
+    for (int y = 0; y < grid_height_; ++y) {
+        for (int x = 0; x < grid_width_; ++x) {
+            
+            // Find cells that are reliable hits (passed the noise filter)
+            if (hit_counts[gridToIndex(x, y)] < lidar_hit_point_) {
+                continue; 
+            }
+
+            // This cell (x, y) is a reliable hit ("ink stamp" center, μ)
+            // Spread its influence to its neighbors (the "ink stamp" radius)
+            for (int dy = -search_radius; dy <= search_radius; ++dy) {
+                for (int dx = -search_radius; dx <= search_radius; ++dx) {
+                    int nx = x + dx;
+                    int ny = y + dy;
+                    if (!isInside(nx, ny)) continue;
+
+                    // Calculate squared distance from hit cell (μ) to neighbor (nx,ny)
+                    double dist_sq = (dx * dx + dy * dy) * resolution_ * resolution_;
+                    
+                    // Calculate Gaussian likelihood (unnormalized PDF)
+                    double likelihood = std::exp(dist_sq * lidar_norm_factor);
+                    
+                    // Update the measurement grid, taking the MAX likelihood
+                    // (if two "ink stamps" overlap, use the darker one)
+                    int n_idx = gridToIndex(nx, ny);
+                    measurement_grid_[n_idx].m_occ_z = std::max(
+                        measurement_grid_[n_idx].m_occ_z, 
+                        likelihood
+                    );
+                }
+            }
         }
     }
-    // --- End Occupied Mass Calculation ---
+    // --- [END MODIFICATION] ---
 }
 
 // updateOccupancy (no changes)
@@ -291,7 +336,7 @@ std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_st
 }
 
 
-// calculateVelocityStatistics (ALL user requests included)
+// calculateVelocityStatistics (MODIFIED: OR logic, Smoothed Radar check)
 void DynamicGridMap::calculateVelocityStatistics(double static_vel_thresh,
                                                  double max_vel_for_scaling,
                                                  bool   use_ego_comp,
@@ -344,20 +389,24 @@ void DynamicGridMap::calculateVelocityStatistics(double static_vel_thresh,
         const bool is_occupied = (c.m_occ > 0.60);
         
         // Input 1: Particle-based check (already includes fusion)
+        // This check is now more reliable because L_radar(static) kills 
+        // bad particles on static walls.
         const bool has_speed_from_particles = (speed > static_vel_thresh);
 
         // Input 2: Radar-based check (NOW uses spatial smoothing as requested)
         double smoothed_vr_hint = 0.0;
-        // Get coordinates from index for the smoothing function
-        int gx = cell_idx % grid_width_;
-        int gy = cell_idx / grid_width_;
+        
+        // [NEW] Get coordinates from index for the smoothing function
+        int gx, gy;
+        indexToGrid(cell_idx, gx, gy); // Use helper function
+        
         bool has_reliable_smoothed_radar = use_radar_ && getSmoothedRadarVrHint(gx, gy, smoothed_vr_hint);
         
         double smoothed_radar_speed = std::abs(smoothed_vr_hint);
         
-        // This variable now uses the smoothed (49-cell) hint
+        // This variable now uses the smoothed (spatial) hint
         const bool has_speed_from_radar = has_reliable_smoothed_radar && (smoothed_radar_speed > static_vel_thresh);
-        // This variable also uses the smoothed (49-cell) hint
+        // This variable also uses the smoothed (spatial) hint
         const bool is_reliably_static_by_radar = has_reliable_smoothed_radar && (smoothed_radar_speed < static_vel_thresh);
 
 
@@ -367,10 +416,12 @@ void DynamicGridMap::calculateVelocityStatistics(double static_vel_thresh,
         if (use_radar_) 
         {
             // --- 1. Radar-Fusion Mode (Using OR as requested) ---
-            // (Particle fusion check) OR (Smoothed radar check)
+            
+            // [MODIFIED] Changed to OR logic
+            // The L_radar(static) change makes this safe (no more dynamic walls)
             dyn_candidate = is_occupied 
                             && !is_reliably_static_by_radar // Veto if reliably static
-                            && (has_speed_from_particles && has_speed_from_radar); // Changed to OR
+                            && (has_speed_from_particles || has_speed_from_radar); // [MODIFIED]
 
             // Safety Nets (remain the same)
             if (use_mc_ && is_occupied && !dyn_candidate && has_speed_from_particles && is_reliably_static_by_radar) { 
@@ -485,11 +536,11 @@ void DynamicGridMap::toMarkerArrayMsg(visualization_msgs::MarkerArray& arr,
             if (c.m_occ > 0.6) {
                 if (c.is_dynamic) { col.r = 1.0f; col.g = 0.0f; col.b = 0.0f; } // Red
                 else { col.r = 0.0f; col.g = 0.0f; col.b = 1.0f; } // Blue
-                col.a = 0.6 + 0.4 * std::min(1.0, c.m_occ);
+                col.a = 0.2 + 0.4 * std::min(1.0, c.m_occ);
             } else if (c.m_free > 0.6) {
-                col.r = col.g = col.b = 1.0f; col.a = 1.0f; // White
+                col.r = col.g = col.b = 1.0f; col.a = 0.5f; // White
             } else {
-                col.r = col.g = col.b = 0.5f; col.a = 1.0f; // Gray
+                col.r = col.g = col.b = 0.5f; col.a = 0.5f; // Gray
             }
             cubes.points.push_back(p);
             cubes.colors.push_back(col);

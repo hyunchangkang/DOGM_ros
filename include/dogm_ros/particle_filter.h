@@ -20,11 +20,15 @@ public:
      * @brief [MODIFIED] Updates particle weights based on BOTH LiDAR and Radar.
      * @param measurement_grid LiDAR occupancy measurements (m_occ_z, m_free_z)
      * @param grid The full GridCell vector containing Radar hints (vr_hint, theta_hint)
+     * @param grid_map The map object (needed for neighbor search - Inaccuracy fix)
      * @param radar_noise_stddev Standard deviation of radar velocity noise (for Gaussian PDF)
+     * @param radar_static_penalty_strength [MODIFIED] Positive strength for static assumption
      */
     void updateWeights(const std::vector<MeasurementCell>& measurement_grid,
                        const std::vector<GridCell>& grid,
-                       double radar_noise_stddev);
+                       const DynamicGridMap& grid_map, // [NEW] For neighbor search
+                       double radar_noise_stddev,
+                       double radar_static_penalty_strength); // [MODIFIED] Renamed
 
     void sortParticlesByGridCell(const DynamicGridMap& grid_map);
     void resample(const std::vector<Particle>& new_born_particles);

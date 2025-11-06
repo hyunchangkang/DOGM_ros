@@ -18,7 +18,7 @@
 class DynamicGridMap {
 public:
     // Constructor
-    // [MODIFIED] Added lidar_point_counts parameter
+    // [MODIFIED] Signature changed for new Lidar model
     DynamicGridMap(double grid_size, double resolution, int num_particles,
                    double process_noise_pos, double process_noise_vel,
                    int radar_buffer_size, int min_radar_points,
@@ -26,10 +26,12 @@ public:
                    bool use_fsd, int fsd_T_static, int fsd_T_free,
                    bool use_mc,
                    bool use_radar,
-                   int lidar_point_counts); // Added lidar_point_counts
+                   int lidar_hit_point,         // [MODIFIED]
+                   double lidar_noise_stddev); // [NEW]
     ~DynamicGridMap() = default; // Default destructor
 
     // Generates the measurement grid based on sensor inputs
+    // [MODIFIED] Now generates a true Likelihood Field for LiDAR
     void generateMeasurementGrid(const sensor_msgs::LaserScan::ConstPtr& scan,
                                  const pcl::PointCloud<mmWaveCloudType>::ConstPtr& radar_cloud);
 
@@ -44,6 +46,7 @@ public:
                                                double dynamic_newborn_vel_stddev);
 
     // Calculates velocity statistics from particles and classifies cells
+    // [MODIFIED] Logic inside is changed (OR logic, smoothed radar check)
     void calculateVelocityStatistics(double static_vel_thresh,
                                      double max_vel_for_scaling,
                                      bool   use_ego_comp,
@@ -66,12 +69,15 @@ public:
     bool worldToGrid(double wx, double wy, int& gx, int& gy) const;
     void gridToWorld(int gx, int gy, double& wx, double& wy) const;
     int gridToIndex(int gx, int gy) const;
+    void indexToGrid(int idx, int& gx, int& gy) const; // [NEW] Helper function
     bool isInside(int gx, int gy) const;
 
-private:
+    // [MODIFIED] Public helper for particle filter (for inaccuracy fix)
     // Calculates a spatially smoothed 1D radar velocity hint
     bool getSmoothedRadarVrHint(int center_gx, int center_gy, double& smoothed_vr_hint) const;
 
+
+private:
     // Grid map properties
     double grid_size_;        // Size of one side of the square grid (meters)
     double resolution_;       // Size of one cell (meters/cell)
@@ -104,8 +110,9 @@ private:
     // General flags
     bool use_radar_;          // Flag indicating if radar fusion is active
 
-    // [NEW] LiDAR processing parameter
-    int lidar_point_counts_; // Minimum LiDAR hits required to consider a cell occupied
+    // [MODIFIED] LiDAR processing parameters
+    int    lidar_hit_point_;    // [MODIFIED] Minimum LiDAR hits to create a likelihood source
+    double lidar_noise_stddev_; // [NEW] Stddev for Lidar Likelihood Field (m)
 };
 
 #endif // DYNAMIC_GRID_MAP_H

@@ -5,6 +5,7 @@
 #include <nav_msgs/OccupancyGrid.h>
 #include <nav_msgs/Odometry.h>
 #include <visualization_msgs/MarkerArray.h> // Keep for DOGM markers
+#include <visualization_msgs/Marker.h>      //for single marker
 #include <string>
 #include <memory>
 #include <algorithm>
@@ -22,6 +23,7 @@
 // [REMOVED] interpolateColor function is no longer needed in this file
 
 // Main ROS node class for the DOGM filter
+//test
 class DogmNode
 {
 public:
@@ -31,6 +33,7 @@ public:
         loadParams(); // Load parameters from YAML file
 
         // Initialize the Dynamic Grid Map object
+        // [MODIFIED] Constructor call updated
         grid_map_ = std::make_unique<DynamicGridMap>(
             grid_size_, grid_res_, num_particles_,
             process_noise_pos_, process_noise_vel_,
@@ -39,7 +42,8 @@ public:
             use_fsd_, fsd_T_static_, fsd_T_free_,
             use_mc_,
             use_radar_,
-            lidar_point_counts_
+            lidar_hit_point_,       // [MODIFIED]
+            lidar_noise_stddev_     // [NEW]
         );
 
         // Setup publishers for grid map and DOGM markers
@@ -61,6 +65,11 @@ public:
         // Setup subscriber for Odometry data if ego-motion compensation is enabled
         if (use_ego_comp_) {
             odom_sub_ = nh_.subscribe<nav_msgs::Odometry>(odom_topic_, 1, &DogmNode::odomCb, this);
+        }
+
+        if (show_ego_velocity_arrow_) {
+            ego_vel_pub_ = nh_.advertise<visualization_msgs::Marker>(ego_vel_marker_topic_, 1);
+            ROS_INFO("Ego velocity debug arrow is ENABLED.");
         }
 
         // Setup timer for the main filter update loop
@@ -85,6 +94,45 @@ private:
         if (!msg) return;
         ego_vx_ = msg->twist.twist.linear.x;
         ego_vy_ = msg->twist.twist.linear.y;
+        if (show_ego_velocity_arrow_)
+        {
+            visualization_msgs::Marker arrow_msg;
+            arrow_msg.header.stamp = msg->header.stamp; // Odom 메시지의 타임스탬프 사용
+            arrow_msg.header.frame_id = base_frame_; // 로봇 기준 좌표계 (e.g., "base_link")
+            arrow_msg.ns = "ego_velocity";
+            arrow_msg.id = 0;
+            arrow_msg.type = visualization_msgs::Marker::ARROW;
+            arrow_msg.action = visualization_msgs::Marker::ADD;
+            arrow_msg.lifetime = ros::Duration(0.5); // 0.5초간 Rviz에 유지됨
+            arrow_msg.pose.orientation.w = 1.0;
+            // 화살표 크기 설정
+            arrow_msg.scale.x = 0.05; // 화살표 몸통 두께 (m)
+            arrow_msg.scale.y = 0.1;  // 화살표 머리 두께 (m)
+            arrow_msg.scale.z = 0.4;  // 화살표 머리 길이 (m)
+
+            // 화살표 색상 (밝은 청록색)
+            arrow_msg.color.a = 1.0; // 불투명
+            arrow_msg.color.r = 0.0;
+            arrow_msg.color.g = 1.0;
+            arrow_msg.color.b = 1.0;
+
+            // 화살표 시작점 (로봇 중앙, 바닥에서 0.1m 위)
+            geometry_msgs::Point p_start;
+            p_start.x = 0; p_start.y = 0; p_start.z = 0.1;
+
+            // 화살표 끝점 (속도 벡터 반영, 1.0배 스케일)
+            // 1 m/s의 속도일 경우 1m 길이의 화살표가 됨
+            geometry_msgs::Point p_end;
+            p_end.x = p_start.x + ego_vx_ * 3.0;
+            p_end.y = p_start.y + ego_vy_ * 3.0;
+            p_end.z = p_start.z; // 동일 높이 유지
+
+            arrow_msg.points.push_back(p_start);
+            arrow_msg.points.push_back(p_end);
+
+            // 마커 발행
+            ego_vel_pub_.publish(arrow_msg);
+        }
     }
 
      // Callback for Radar PointCloud2 messages
@@ -118,6 +166,7 @@ private:
         last_update_time_ = now;
 
         // 1. Generate Measurement Grid from LiDAR & Process Radar Hints
+        // [MODIFIED] Call uses member variables for new params
         grid_map_->generateMeasurementGrid(last_scan_, (use_radar_ && has_radar_) ? last_radar_cloud_ : nullptr);
         has_radar_ = false; // Consume the radar data for this cycle
 
@@ -131,9 +180,12 @@ private:
         pf.sortParticlesByGridCell(*grid_map_);
 
         // 4. Update particle weights
+        // [MODIFIED] Call signature updated
         pf.updateWeights(grid_map_->getMeasurementGrid(),
                          grid_map_->getGrid(),
-                         use_radar_ ? radar_noise_stddev_ : 1000.0);
+                         *grid_map_, // [NEW] Pass map object
+                         use_radar_ ? radar_noise_stddev_ : 1000.0,
+                         use_radar_ ? radar_static_penalty_strength_ : 0.01); // [MODIFIED] Renamed
 
         // 5. Update grid cell occupancy
         grid_map_->updateOccupancy(birth_prob_);
@@ -181,7 +233,7 @@ private:
         pnh_.param("grid_size", grid_size_, 3.0);
         pnh_.param("grid_resolution", grid_res_, 0.15);
         pnh_.param("filter_update_rate", filter_hz_, 10.0);
-        pnh_.param("lidar_point_counts", lidar_point_counts_, 3);
+        // pnh_.param("lidar_point_counts", lidar_point_counts_, 3); // [REMOVED]
         pnh_.param("num_particles", num_particles_, 20000);
         pnh_.param("process_noise_pos", process_noise_pos_, 0.03);
         pnh_.param("process_noise_vel", process_noise_vel_, 0.1);
@@ -208,8 +260,15 @@ private:
         pnh_.param("show_velocity_arrows", show_velocity_arrows_, true);
         pnh_.param("use_ego_comp", use_ego_comp_, true);
         pnh_.param("odom_topic", odom_topic_, std::string("/odom"));
+        pnh_.param("show_ego_velocity_arrow", show_ego_velocity_arrow_, true);
+        pnh_.param("ego_vel_marker_topic", ego_vel_marker_topic_, std::string("/dogm/ego_velocity_arrow"));
 
-        // [REMOVED] Parameters related only to radar visualization are removed
+        // [NEW] Load new parameters
+        pnh_.param("lidar_hit_point", lidar_hit_point_, 5);
+        pnh_.param("lidar_noise_stddev", lidar_noise_stddev_, 0.1);
+        
+        // [MODIFIED] Renamed param and loading as positive value
+        pnh_.param("radar_static_penalty_strength", radar_static_penalty_strength_, 0.5); 
     }
 
 private:
@@ -223,6 +282,7 @@ private:
     ros::Subscriber radar_sub_; // Keep subscriber to receive data
     ros::Publisher  grid_pub_;  // DOGM grid
     ros::Publisher  marker_pub_; // DOGM markers (cells/arrows)
+    ros::Publisher ego_vel_pub_; // Robot ego velocity publisher
     // [REMOVED] ros::Publisher radar_viz_pub_;
     ros::Timer      timer_;
 
@@ -234,7 +294,7 @@ private:
     std::string lidar_topic_, radar_topic_, grid_topic_, marker_topic_, base_frame_, odom_topic_;
     double grid_size_, grid_res_, filter_hz_, persistence_prob_, birth_prob_;
     int    num_particles_;
-    int    lidar_point_counts_;
+    // int    lidar_point_counts_; // [REMOVED]
     double process_noise_pos_, process_noise_vel_, max_velocity_, newborn_vel_stddev_;
     double min_dynamic_birth_ratio_, max_dynamic_birth_ratio_, max_radar_speed_for_scaling_;
     double dynamic_newborn_vel_stddev_;
@@ -247,7 +307,13 @@ private:
     double radar_noise_stddev_;
     bool   use_fsd_, use_mc_;
     int    fsd_T_static_, fsd_T_free_;
-    // [REMOVED] double radar_viz_lifetime_;
+    std::string ego_vel_marker_topic_;
+    bool show_ego_velocity_arrow_;
+
+    // [NEW] New parameters
+    int    lidar_hit_point_;
+    double lidar_noise_stddev_;
+    double radar_static_penalty_strength_; // [MODIFIED] Renamed
 
     // State variables
     sensor_msgs::LaserScan::ConstPtr last_scan_;

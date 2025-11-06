@@ -9,7 +9,7 @@ radar_topic: "/ti_mmwave/radar_scan_pcl_0" # Topic for sensor_msgs/PointCloud2 (
 grid_topic: "/dogm/grid"                 # Topic for nav_msgs/OccupancyGrid output
 marker_topic: "/dogm/markers"            # Topic for visualization_msgs/MarkerArray (cells and arrows)
 base_frame: "base_link"                  # Robot's base frame (for calculating grid position)
-odom_topic: "/odom"                      # Topic for nav_msgs/Odometry (for ego-motion compensation)
+odom_topic: "/odometry/filtered"                      # Topic for nav_msgs/Odometry (for ego-motion compensation)
 
 # 2. Grid Map & Filter Base Settings
 # -------------------------------------------------------------------
@@ -17,15 +17,14 @@ grid_size: 3.0                           # Total width/height of the square grid
 grid_resolution: 0.10                    # Size of a single grid cell (meters)
 filter_update_rate: 10.0                  # Main filter loop frequency (Hz)
 
-# [NEW] Minimum LiDAR hits in a cell to *start* calculating occupancy mass.
-# Prevents stray points (noise) from creating occupied cells.
-#
-lidar_point_counts: 5
+# [NEW] Minimum LiDAR hits in a cell to be considered a 'reliable' source
+# for spreading the Likelihood Field. (Noise filter)
+lidar_hit_point: 5
 
 # 3. Particle Filter & Process Model (Core Algorithm)
 # -------------------------------------------------------------------
 num_particles: 5000                     # Total number of particles used by the filter
-max_velocity: 1.5                        # Maximum speed a particle can have (m/s)
+max_velocity: 3                          # Maximum speed a particle can have (m/s)
 process_noise_pos: 0.03                  # Stddev for position "random walk" in predict step (m)
 process_noise_vel: 0.05                  # Stddev for velocity "random walk" in predict step (m/s)
 
@@ -59,7 +58,7 @@ velocity_damping_factor: 0.2             # How much to slow down (0.2 = 80% redu
 # The FINAL threshold. If a cell's average particle speed is above this,
 # 'has_speed_from_particles' becomes true.
 #
-static_velocity_threshold: 0.2
+static_velocity_threshold: 0.3
 
 # 6. Radar Sensor Fusion (Key parameters)
 # -------------------------------------------------------------------
@@ -68,15 +67,15 @@ use_radar: true                         # Master toggle for all radar fusion log
 # 6a. Radar Hint Generation (Temporal & Spatial Smoothing)
 # How many frames a radar point is kept in a cell's buffer.
 #
-radar_buffer_size: 5
+radar_buffer_size: 3
 # Minimum points needed in the buffer to create a reliable 'radar_vr_hint'.
 #
-min_radar_points: 3
+min_radar_points: 2
 
 # Radius for *spatial* smoothing (borrowing hints from neighbors).
 # 3 means it checks a 7x7 (49-cell) area around the target cell.
 #
-radar_hint_search_radius: 2 
+radar_hint_search_radius: 2
 
 # --- Birth Ratio Scaling (Your Question) ---
 # Default ratio of dynamic particles if NO RADAR HINT is found. (e.g., 10%)
@@ -100,6 +99,18 @@ max_radar_speed_for_scaling: 1.0
 #
 radar_noise_stddev: 0.4
 
+# [NEW] Stddev for Lidar Likelihood Field (m)
+# The 'stddev' (size of the "ink stamp") for the L_lidar model.
+#
+lidar_noise_stddev: 0.05
+
+# [MODIFIED] Renamed and changed to a POSITIVE value.
+# Controls how strongly moving particles are penalized when no radar hint
+# is present (static assumption).
+# Higher value = stronger penalty.
+#
+radar_static_penalty_strength: 0.5 # (Old: radar_absent_penalty_factor: -0.5)
+
 # 6c. Safety Net 1: Measurement Correction (Handles crossing objects)
 # If particles show speed but radar shows 0 (crossing object),
 # this forces a 'dynamic' classification.
@@ -120,3 +131,6 @@ fsd_T_free: 5
 show_velocity_arrows: true               # Toggle for RViz velocity markers
 use_ego_comp: true                       # Compensate for robot's own movement
 max_velocity_for_scaling: 2.0            # Max speed for coloring RViz markers
+
+show_ego_velocity_arrow: true
+ego_vel_marker_topic: "/dogm/ego_velocity_arrow"
