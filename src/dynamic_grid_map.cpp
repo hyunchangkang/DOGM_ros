@@ -1,8 +1,4 @@
 // dogm_ros/src/dynamic_grid_map.cpp
-// Contains all modifications for:
-// 1. [NEW] Likelihood Field generation (L_lidar)
-// 2. Branched 'generateNewParticles' logic (for LiDAR-Only)
-// 3. [MODIFIED] 'calculateVelocityStatistics' logic (OR logic + Smoothed Radar)
 
 #include "dogm_ros/dynamic_grid_map.h"
 #include <algorithm>
@@ -11,8 +7,7 @@
 #include <vector>
 #include <random>
 
-
-// Constructor (MODIFIED)
+// [Constructor]
 DynamicGridMap::DynamicGridMap(double grid_size, double resolution, int num_particles,
                                double process_noise_pos, double process_noise_vel,
                                int radar_buffer_size, int min_radar_points,
@@ -21,7 +16,8 @@ DynamicGridMap::DynamicGridMap(double grid_size, double resolution, int num_part
                                bool use_mc,
                                bool use_radar,
                                int lidar_hit_point,      // [MODIFIED]
-                               double lidar_noise_stddev) // [NEW]
+                               double lidar_noise_stddev, // [NEW]
+                               double mode_cluster_velocity_thresh) // [NEW]
     : grid_size_(grid_size),
       resolution_(resolution),
       radar_buffer_size_(radar_buffer_size),
@@ -34,6 +30,9 @@ DynamicGridMap::DynamicGridMap(double grid_size, double resolution, int num_part
       use_radar_(use_radar),
       lidar_hit_point_(lidar_hit_point),         // [MODIFIED]
       lidar_noise_stddev_(lidar_noise_stddev), // [NEW]
+      // [NEW] Store the SQUARED threshold for cheaper comparison
+      mode_cluster_velocity_thresh_sq_(mode_cluster_velocity_thresh * mode_cluster_velocity_thresh),
+      // [FIXED] Corrected typo from mt19373 to mt19937
       random_generator_(std::mt19937(std::random_device()()))
 {
     grid_width_  = static_cast<int>(std::round(grid_size_ / resolution_));
@@ -47,7 +46,7 @@ DynamicGridMap::DynamicGridMap(double grid_size, double resolution, int num_part
     );
 }
 
-// Basic grid conversion functions (no changes, but indexToGrid added)
+// [Grid conversion functions]
 bool DynamicGridMap::isInside(int gx, int gy) const
 {
     return (gx >= 0 && gx < grid_width_ && gy >= 0 && gy < grid_height_);
@@ -58,7 +57,6 @@ int DynamicGridMap::gridToIndex(int gx, int gy) const
     return gy * grid_width_ + gx;
 }
 
-// [NEW] Helper function
 void DynamicGridMap::indexToGrid(int idx, int& gx, int& gy) const
 {
     gy = idx / grid_width_;
@@ -79,11 +77,18 @@ void DynamicGridMap::gridToWorld(int gx, int gy, double& wx, double& wy) const
     wy = origin_y_ + (static_cast<double>(gy) + 0.5) * resolution_;
 }
 
-// generateMeasurementGrid (MODIFIED: Lidar Likelihood Field)
+// [generateMeasurementGrid - MODIFIED]
 void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::ConstPtr& scan, const pcl::PointCloud<mmWaveCloudType>::ConstPtr& radar_cloud)
 {
     // 1. Initialize measurement grid and age/filter Radar buffer
-    for (auto& m : measurement_grid_) { m.m_occ_z = 0.0; m.m_free_z = 0.0; }
+    // [MODIFIED] Reset the new model parameters
+    for (auto& m : measurement_grid_) { 
+        m.m_free_z = 0.0; 
+        m.has_lidar_model = false; // Reset LiDAR model
+    }
+
+    // --- Calculate Time-Averaged (Single Cell) Radar Hint ---
+    // This v_r_hint is used by getSmoothedRadarVrHint and by updateWeights (for cos/sin)
     for (auto& c : grid_) {
         for (auto& rp : c.radar_points_buffer) { rp.age++; }
         c.radar_points_buffer.erase(
@@ -91,9 +96,6 @@ void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::Const
                            [this](const RadarPoint& rp) { return rp.age > this->radar_buffer_size_; }),
             c.radar_points_buffer.end());
 
-        // Calculate time-weighted average '1D velocity hint (vr)'
-        // This is the 1-cell hint, which we will NOT use in the final check anymore,
-        // but it is still used by the smoothing function, so we keep it.
         if (c.radar_points_buffer.size() >= min_radar_points_) {
             double sum_weighted_vr = 0.0, sum_weighted_x = 0.0, sum_weighted_y = 0.0, sum_weights = 0.0;
             for (const auto& rp : c.radar_points_buffer) {
@@ -104,8 +106,10 @@ void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::Const
                 sum_weights += weight;
             }
             if (sum_weights > 1e-9) {
-                c.radar_vr_hint = sum_weighted_vr / sum_weights;
+                c.radar_vr_hint = sum_weighted_vr / sum_weights; // (Time-averaged hint)
                 c.radar_theta_hint = std::atan2(sum_weighted_y / sum_weights, sum_weighted_x / sum_weights);
+                c.radar_cos_theta = std::cos(c.radar_theta_hint);
+                c.radar_sin_theta = std::sin(c.radar_theta_hint);
                 c.has_reliable_radar = true;
             } else {
                 c.has_reliable_radar = false;
@@ -116,8 +120,10 @@ void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::Const
             c.radar_vr_hint = 0.0;
         }
     }
+    // --- (End Radar hint calculation) ---
 
-    // 2. Add new Radar data to buffer (only if radar is enabled)
+
+    // 2. Add new Radar data to buffer (no change)
     if (use_radar_ && radar_cloud) {
         for (const auto& pt : radar_cloud->points) {
             int gx, gy;
@@ -134,7 +140,9 @@ void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::Const
     }
 
     // 3. Process LiDAR data (ray casting)
-    std::vector<int> hit_counts(grid_width_ * grid_height_, 0);
+    // [MODIFIED] We now need to store the actual hit coordinates per cell
+    std::vector<std::vector<std::pair<double, double>>> cell_hits(grid_width_ * grid_height_);
+
     if (!scan) return;
     const double angle_min = static_cast<double>(scan->angle_min);
     const double angle_inc = static_cast<double>(scan->angle_increment);
@@ -145,7 +153,7 @@ void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::Const
         if (!std::isfinite(r)) continue;
         const double th = angle_min + angle_inc * static_cast<double>(i);
 
-        // --- Ray Casting for Free Space ---
+        // --- Ray Casting for Free Space (no change) ---
         const double step  = resolution_ * 0.9;
         const double limit = std::min(r, range_max);
         for (double rr = 0.0; rr < limit; rr += step) {
@@ -154,71 +162,85 @@ void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::Const
             int gx, gy;
             if (!worldToGrid(wx, wy, gx, gy)) break;
             auto& cell = measurement_grid_[gridToIndex(gx, gy)];
-            
-            // [MODIFICATION 1: Flickering fix]
-            cell.m_free_z = std::min(1.0, cell.m_free_z + 0.03); // Reduced increment
+            cell.m_free_z = std::min(1.0, cell.m_free_z + 0.03); // Flickering fix
         }
         // --- End Ray Casting ---
 
-        // --- Hit Counting for Occupied Space ---
+        // --- [MODIFIED] Hit Coordinate Buffering ---
         if (r < range_max) {
             const double wx = r * std::cos(th);
             const double wy = r * std::sin(th);
             int gx, gy;
             if (worldToGrid(wx, wy, gx, gy)) {
-                hit_counts[gridToIndex(gx, gy)]++;
+                // Store the actual (wx, wy) coordinate
+                cell_hits[gridToIndex(gx, gy)].push_back({wx, wy});
             }
         }
-        // --- End Hit Counting ---
+        // --- End Hit Buffering ---
     }
 
-    // --- [MODIFIED] Calculate Lidar Likelihood Field (m_occ_z) ---
-    // (Replaces the old hit_counts -> m_occ_z logic)
+    // --- [REMOVED] Old Lidar Likelihood Field (m_occ_z) "ink stamp" logic ---
 
-    // Pre-calculate Gaussian constant (C)
-    const double lidar_variance = lidar_noise_stddev_ * lidar_noise_stddev_;
-    const double lidar_norm_factor = -0.5 / std::max(1e-9, lidar_variance); // This is 'C'
+    // --- [NEW] Calculate Lidar Measurement Model (μ, Σ) ---
+    // This replaces the old "ink stamp" logic.
+    
+    // Get the variance from the fixed stddev in params (for regularization)
+    const double lidar_variance_reg = lidar_noise_stddev_ * lidar_noise_stddev_;
 
-    // Determine search radius (e.g., 3-sigma)
-    const int search_radius = static_cast<int>(std::ceil(3.0 * lidar_noise_stddev_ / resolution_));
+    for (int idx = 0; idx < static_cast<int>(grid_.size()); ++idx) {
+        auto& meas_cell = measurement_grid_[idx];
+        const auto& hits = cell_hits[idx];
 
-    for (int y = 0; y < grid_height_; ++y) {
-        for (int x = 0; x < grid_width_; ++x) {
-            
-            // Find cells that are reliable hits (passed the noise filter)
-            if (hit_counts[gridToIndex(x, y)] < lidar_hit_point_) {
-                continue; 
-            }
-
-            // This cell (x, y) is a reliable hit ("ink stamp" center, μ)
-            // Spread its influence to its neighbors (the "ink stamp" radius)
-            for (int dy = -search_radius; dy <= search_radius; ++dy) {
-                for (int dx = -search_radius; dx <= search_radius; ++dx) {
-                    int nx = x + dx;
-                    int ny = y + dy;
-                    if (!isInside(nx, ny)) continue;
-
-                    // Calculate squared distance from hit cell (μ) to neighbor (nx,ny)
-                    double dist_sq = (dx * dx + dy * dy) * resolution_ * resolution_;
-                    
-                    // Calculate Gaussian likelihood (unnormalized PDF)
-                    double likelihood = std::exp(dist_sq * lidar_norm_factor);
-                    
-                    // Update the measurement grid, taking the MAX likelihood
-                    // (if two "ink stamps" overlap, use the darker one)
-                    int n_idx = gridToIndex(nx, ny);
-                    measurement_grid_[n_idx].m_occ_z = std::max(
-                        measurement_grid_[n_idx].m_occ_z, 
-                        likelihood
-                    );
-                }
-            }
+        // Check if we have enough points to build a reliable model
+        if (hits.size() < static_cast<size_t>(lidar_hit_point_)) {
+            continue; // Not enough hits, model remains invalid (has_lidar_model = false)
         }
+
+        // 1. Calculate Mean (μ) - (μ_x, μ_y)
+        double sum_x = 0.0, sum_y = 0.0;
+        for (const auto& p : hits) {
+            sum_x += p.first;
+            sum_y += p.second;
+        }
+        meas_cell.mean_x = sum_x / hits.size();
+        meas_cell.mean_y = sum_y / hits.size();
+
+        // 2. Calculate Covariance (Σ)
+        double sum_xx = 0.0, sum_xy = 0.0, sum_yy = 0.0;
+        for (const auto& p : hits) {
+            double dx = p.first - meas_cell.mean_x;
+            double dy = p.second - meas_cell.mean_y;
+            sum_xx += dx * dx;
+            sum_xy += dx * dy;
+            sum_yy += dy * dy;
+        }
+
+        double n_minus_1 = (hits.size() > 1) ? (hits.size() - 1) : 1.0;
+        
+        // Add sensor noise (regularization) to the diagonal
+        double cov_xx = (sum_xx / n_minus_1) + lidar_variance_reg;
+        double cov_xy = (sum_xy / n_minus_1);
+        double cov_yy = (sum_yy / n_minus_1) + lidar_variance_reg;
+        
+        // 3. Pre-calculate Inverse (Σ⁻¹)
+        double det = cov_xx * cov_yy - cov_xy * cov_xy;
+
+        if (std::abs(det) < 1e-9) {
+            continue; // Covariance matrix is singular, model is invalid
+        }
+
+        double inv_det = 1.0 / det;
+        meas_cell.inv_cov_xx =  cov_yy * inv_det;
+        meas_cell.inv_cov_xy = -cov_xy * inv_det;
+        meas_cell.inv_cov_yy =  cov_xx * inv_det;
+        
+        meas_cell.has_lidar_model = true;
     }
-    // --- [END MODIFICATION] ---
+    // --- [END NEW] ---
 }
 
-// updateOccupancy (no changes)
+
+// [updateOccupancy] (Modified to use has_lidar_model instead of m_occ_z)
 void DynamicGridMap::updateOccupancy(double birth_prob)
 {
     for (auto& c : grid_) {
@@ -231,13 +253,21 @@ void DynamicGridMap::updateOccupancy(double birth_prob)
     for (int idx = 0; idx < static_cast<int>(grid_.size()); ++idx) {
         auto& cell = grid_[idx];
         const auto& meas = measurement_grid_[idx];
+
+        // [MODIFIED] m_occ_z is gone. We use 'has_lidar_model' as the occupancy signal.
+        // We treat 'has_lidar_model' as m_occ_z=1.0 and lack of it as m_occ_z=0.0
+        double m_occ_z_proxy = meas.has_lidar_model ? 1.0 : 0.0;
+
         double m_occ_pred = std::min(1.0, std::max(0.0, cell.m_occ));
         double m_free_pred= std::min(1.0, std::max(0.0, cell.m_free));
         double m_unk_pred = std::max(0.0, 1.0 - m_occ_pred - m_free_pred);
-        double K = m_occ_pred * meas.m_free_z + m_free_pred * meas.m_occ_z;
+
+        // [MODIFIED] Use the proxy value
+        double K = m_occ_pred * meas.m_free_z + m_free_pred * m_occ_z_proxy;
         double norm = 1.0 / std::max(1e-9, (1.0 - K));
-        double m_occ_upd = norm * (m_occ_pred * (1.0 - meas.m_free_z) + m_unk_pred * meas.m_occ_z);
-        double m_free_upd= norm * (m_free_pred * (1.0 - meas.m_occ_z) + m_unk_pred * meas.m_free_z);
+        double m_occ_upd = norm * (m_occ_pred * (1.0 - meas.m_free_z) + m_unk_pred * m_occ_z_proxy);
+        double m_free_upd= norm * (m_free_pred * (1.0 - m_occ_z_proxy) + m_unk_pred * meas.m_free_z);
+        
         m_occ_upd = std::min(1.0, std::max(0.0, m_occ_upd));
         m_free_upd= std::min(1.0, std::max(0.0, m_free_upd));
         double term = m_occ_pred + birth_prob * m_unk_pred;
@@ -248,7 +278,7 @@ void DynamicGridMap::updateOccupancy(double birth_prob)
     }
 }
 
-// getSmoothedRadarVrHint (no changes)
+// [getSmoothedRadarVrHint] (no change)
 bool DynamicGridMap::getSmoothedRadarVrHint(int center_gx, int center_gy, double& smoothed_vr_hint) const
 {
     double sum_weighted_vr = 0.0, sum_weights = 0.0;
@@ -274,41 +304,57 @@ bool DynamicGridMap::getSmoothedRadarVrHint(int center_gx, int center_gy, double
     return false;
 }
 
-// generateNewParticles (LiDAR-Only birth logic included)
-std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_stddev, double min_dynamic_birth_ratio, double max_dynamic_birth_ratio, double max_radar_speed_for_scaling, double dynamic_newborn_vel_stddev)
+// [generateNewParticles - MODIFIED]
+// Now uses the pre-calculated mean_vx/mean_vy for better direction
+std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_stddev,
+                                               double min_dynamic_birth_ratio,
+                                               double max_dynamic_birth_ratio,
+                                               double max_radar_speed_for_scaling,
+                                               double dynamic_newborn_vel_stddev)
 {
     std::vector<Particle> new_particles;
     std::normal_distribution<double> static_vel_dist(0.0, newborn_vel_stddev);
-    std::normal_distribution<double> dynamic_vel_dist(0.0, dynamic_newborn_vel_stddev);
+    // [MODIFIED] Use a smaller noise stddev for inheriting direction
+    std::normal_distribution<double> dynamic_noise_dist(0.0, newborn_vel_stddev); // Use newborn_vel_stddev as base noise
+    std::normal_distribution<double> dynamic_fallback_dist(0.0, dynamic_newborn_vel_stddev); // Old random direction
 
     for (int y = 0; y < grid_height_; ++y) {
         for (int x = 0; x < grid_width_; ++x) {
             int idx = gridToIndex(x, y);
-            const auto& cell = grid_[idx];
+            const auto& cell = grid_[idx]; // Get the cell
 
             if (cell.rho_b > 0.5 && cell.m_occ > 0.6) {
                 int num_to_birth = static_cast<int>(std::ceil(cell.rho_b * 4.0));
-                double smoothed_vr = 0.0;
                 
-                // [MODIFICATION 2: LiDAR-Only Particle Birth]
+                double smoothed_vr = 0.0;
+                bool has_reliable_smoothed_radar = false;
+                double smoothed_speed = 0.0;
                 double current_dynamic_ratio = min_dynamic_birth_ratio;
+                
                 if (use_radar_)
                 {
+                    // Use getSmoothedRadarVrHint to determine the *ratio*
                     if (getSmoothedRadarVrHint(x, y, smoothed_vr)) {
-                        double smoothed_speed = std::abs(smoothed_vr);
+                        has_reliable_smoothed_radar = true;
+                        smoothed_speed = std::abs(smoothed_vr);
+                        
                         double scale = std::min(1.0, smoothed_speed / std::max(1e-6, max_radar_speed_for_scaling));
-                        current_dynamic_ratio = min_dynamic_birth_ratio + (max_dynamic_birth_ratio - min_dynamic_birth_ratio) * scale;
+                        current_dynamic_ratio = min_dynamic_birth_ratio + 
+                                              (max_dynamic_birth_ratio - min_dynamic_birth_ratio) * scale;
+                    }
+                    else {
+                        current_dynamic_ratio = min_dynamic_birth_ratio;
                     }
                 }
                 else
                 {
                     current_dynamic_ratio = max_dynamic_birth_ratio;
                 }
-                // [END MODIFICATION 2]
 
                 int num_dynamic = static_cast<int>(num_to_birth * current_dynamic_ratio);
                 int num_static = num_to_birth - num_dynamic;
 
+                // --- Static Particle Birth (no change) ---
                 for (int i = 0; i < num_static; ++i) {
                     Particle p;
                     gridToWorld(x, y, p.x, p.y);
@@ -316,17 +362,41 @@ std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_st
                     p.vy = static_vel_dist(random_generator_);
                     p.weight = cell.rho_b / static_cast<double>(num_to_birth);
                     p.grid_cell_idx = idx;
-                    p.age = 0;
+                    p.age = 0; // Newborns have age 0
                     new_particles.push_back(p);
                 }
+                
+                // --- [MODIFIED] Dynamic Particle Birth ---
+                // Check if the cell has a valid direction calculated (from the new flow)
+                double cell_mean_speed = std::sqrt(cell.mean_vx * cell.mean_vx + cell.mean_vy * cell.mean_vy);
+
                 for (int i = 0; i < num_dynamic; ++i) {
                     Particle p;
                     gridToWorld(x, y, p.x, p.y);
-                    p.vx = dynamic_vel_dist(random_generator_);
-                    p.vy = dynamic_vel_dist(random_generator_);
+                    
+                    // [NEW LOGIC] Inherit direction from the cell's calculated mean velocity
+                    if (cell.is_dynamic && cell_mean_speed > 0.1) 
+                    {
+                        // Inherit the calculated direction and add small noise
+                        p.vx = cell.mean_vx + dynamic_noise_dist(random_generator_);
+                        p.vy = cell.mean_vy + dynamic_noise_dist(random_generator_);
+                    }
+                    else 
+                    {
+                        // Fallback (no reliable direction): Use the old "random direction" method
+                        double speed;
+                        int attempts = 0;
+                        do {
+                            p.vx = dynamic_fallback_dist(random_generator_);
+                            p.vy = dynamic_fallback_dist(random_generator_);
+                            speed = std::sqrt(p.vx * p.vx + p.vy * p.vy);
+                            attempts++;
+                        } while (speed < 0.2 && attempts < 10);
+                    }
+                    
                     p.weight = cell.rho_b / static_cast<double>(num_to_birth);
                     p.grid_cell_idx = idx;
-                    p.age = 0;
+                    p.age = 0; // Newborns have age 0
                     new_particles.push_back(p);
                 }
             }
@@ -336,16 +406,25 @@ std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_st
 }
 
 
-// calculateVelocityStatistics (MODIFIED: OR logic, Smoothed Radar check)
+// [calculateVelocityStatistics - MODIFIED]
+// This function now runs on particles *before* resampling.
+// The "age > 0" filter is NO LONGER NEEDED, as this set *only* contains survivors.
 void DynamicGridMap::calculateVelocityStatistics(double static_vel_thresh,
                                                  double max_vel_for_scaling,
                                                  bool   use_ego_comp,
                                                  double ego_vx, double ego_vy)
 {
-    // 1. Pre-process (no changes)
+    // 1. Pre-process (Reset cell state before recalculating)
     for (auto& cell : grid_) {
-        cell.dynamic_score *= 0.90;
+        // Reset dynamic/static state (will be re-calculated)
+        cell.is_dynamic = false; 
+        cell.dyn_streak = 0;
+        cell.stat_streak = 0;
+        // Keep old velocity mean for now, but reset visualization score
+        cell.dynamic_score *= 0.85; 
         if (cell.dynamic_score < 0.01) cell.dynamic_score = 0.0;
+        
+        // FSD logic (no change)
         if (cell.m_free > 0.8) {
             cell.free_streak = std::min<std::uint8_t>(255, cell.free_streak + 1);
         } else if (cell.m_occ > 0.6) {
@@ -353,77 +432,99 @@ void DynamicGridMap::calculateVelocityStatistics(double static_vel_thresh,
         }
     }
 
+    // Get the (t-1) survivor particles *before* resampling
     auto& parts = particle_filter_->getParticles();
+    
+    // Hysteresis thresholds (no change)
     const int need_on_frames  = 2;
-    const int need_off_frames = 4;
+    const int need_off_frames = 2;
 
     // 2. Define lambda for processing particles in a cell
     auto flush_cell = [&](int cell_idx, int start, int end) {
         if (cell_idx < 0 || cell_idx >= static_cast<int>(grid_.size())) return;
         auto& c = grid_[cell_idx];
 
-        // --- Calculate Particle Statistics (no changes) ---
+        // --- Calculate Particle Statistics (Winner-Clustering) ---
+        // This particle set is pre-resampling, so it only contains survivors (age > 0)
+        // The "age > 0" check is no longer needed here.
         if (end - start <= 2) {
             c.stat_streak = std::min<std::uint8_t>(255, c.stat_streak + 1);
             if (c.stat_streak >= need_off_frames) c.is_dynamic = false;
             c.dyn_streak = 0; return;
         }
-        double w_sum=0, vx_sum=0, vy_sum=0;
+
+        // Find winner based on *uneven* weights (this is correct)
+        double max_weight = -1.0;
+        int winner_idx = start;
         for (int j = start; j < end; ++j) {
-            w_sum += parts[j].weight; vx_sum += parts[j].weight * parts[j].vx; vy_sum += parts[j].weight * parts[j].vy;
+            if (parts[j].weight > max_weight) {
+                max_weight = parts[j].weight;
+                winner_idx = j;
+            }
         }
-        if (w_sum <= 1e-9) {
-             c.stat_streak = std::min<std::uint8_t>(255, c.stat_streak + 1);
+        
+        const double winner_vx = parts[winner_idx].vx;
+        const double winner_vy = parts[winner_idx].vy;
+
+        double mode_w_sum = 0.0;
+        double mode_vx_sum = 0.0;
+        double mode_vy_sum = 0.0;
+        const double VELOCITY_THRESHOLD_SQ = mode_cluster_velocity_thresh_sq_; 
+
+        // Average using *uneven* weights (this is also correct)
+        for (int j = start; j < end; ++j) {
+            const double dvx = parts[j].vx - winner_vx;
+            const double dvy = parts[j].vy - winner_vy;
+            const double dist_sq = dvx * dvx + dvy * dvy;
+
+            if (dist_sq < VELOCITY_THRESHOLD_SQ) {
+                mode_w_sum += parts[j].weight;
+                mode_vx_sum += parts[j].weight * parts[j].vx;
+                mode_vy_sum += parts[j].weight * parts[j].vy;
+            }
+        }
+
+        if (mode_w_sum <= 1e-9) {
+            c.stat_streak = std::min<std::uint8_t>(255, c.stat_streak + 1);
             if (c.stat_streak >= need_off_frames) c.is_dynamic = false;
-            c.dyn_streak = 0; return;
+            c.dyn_streak = 0; 
+            return;
         }
-        c.mean_vx = vx_sum / w_sum; c.mean_vy = vy_sum / w_sum;
-        double speed = std::hypot(c.mean_vx, c.mean_vy);
-        if (use_ego_comp) { speed = std::hypot(c.mean_vx - ego_vx, c.mean_vy - ego_vy); }
-        // --- End Particle Statistics ---
 
+        // --- This is the "clean" velocity calculation the user wanted ---
+        c.mean_vx = mode_vx_sum / mode_w_sum;
+        c.mean_vy = mode_vy_sum / mode_w_sum;
+        // --- This velocity is now available for generateNewParticles ---
 
-        // ================== [MODIFICATION 3: User Request Logic] ==================
+        double speed = std::sqrt(c.mean_vx * c.mean_vx + c.mean_vy * c.mean_vy);
+        if (use_ego_comp) { 
+            double rel_vx = c.mean_vx - ego_vx;
+            double rel_vy = c.mean_vy - ego_vy;
+            speed = std::sqrt(rel_vx * rel_vx + rel_vy * rel_vy);
+        }
 
         // --- Determine Dynamic Candidate Status (Inputs) ---
         const bool is_occupied = (c.m_occ > 0.60);
-        
-        // Input 1: Particle-based check (already includes fusion)
-        // This check is now more reliable because L_radar(static) kills 
-        // bad particles on static walls.
         const bool has_speed_from_particles = (speed > static_vel_thresh);
 
-        // Input 2: Radar-based check (NOW uses spatial smoothing as requested)
         double smoothed_vr_hint = 0.0;
-        
-        // [NEW] Get coordinates from index for the smoothing function
         int gx, gy;
-        indexToGrid(cell_idx, gx, gy); // Use helper function
+        indexToGrid(cell_idx, gx, gy);
         
         bool has_reliable_smoothed_radar = use_radar_ && getSmoothedRadarVrHint(gx, gy, smoothed_vr_hint);
-        
         double smoothed_radar_speed = std::abs(smoothed_vr_hint);
         
-        // This variable now uses the smoothed (spatial) hint
         const bool has_speed_from_radar = has_reliable_smoothed_radar && (smoothed_radar_speed > static_vel_thresh);
-        // This variable also uses the smoothed (spatial) hint
         const bool is_reliably_static_by_radar = has_reliable_smoothed_radar && (smoothed_radar_speed < static_vel_thresh);
 
-
-        // --- Logic Branching (use_radar flag) ---
-        bool dyn_candidate = false; // Initialize
+        bool dyn_candidate = false;
 
         if (use_radar_) 
         {
-            // --- 1. Radar-Fusion Mode (Using OR as requested) ---
-            
-            // [MODIFIED] Changed to OR logic
-            // The L_radar(static) change makes this safe (no more dynamic walls)
             dyn_candidate = is_occupied 
-                            && !is_reliably_static_by_radar // Veto if reliably static
-                            && (has_speed_from_particles || has_speed_from_radar); // [MODIFIED]
+                            && !is_reliably_static_by_radar
+                            && (has_speed_from_particles || has_speed_from_radar);
 
-            // Safety Nets (remain the same)
             if (use_mc_ && is_occupied && !dyn_candidate && has_speed_from_particles && is_reliably_static_by_radar) { 
                 dyn_candidate = true;
             }
@@ -435,16 +536,11 @@ void DynamicGridMap::calculateVelocityStatistics(double static_vel_thresh,
         }
         else 
         {
-            // --- 2. LiDAR-Only Mode ---
-            // (Particle fusion check) only
             dyn_candidate = is_occupied && has_speed_from_particles;
         }
-        // =====================================================================
 
-
-        // --- Hysteresis update logic (no changes) ---
+        // --- Hysteresis update logic ---
         if (dyn_candidate) {
-            // 'has_speed_from_radar' now uses the smoothed hint, which is fine
             int streak_increase = (has_speed_from_radar) ? 2 : 1;
             c.dyn_streak  = std::min<std::uint8_t>(255, c.dyn_streak + streak_increase);
             c.stat_streak = 0;
@@ -453,7 +549,7 @@ void DynamicGridMap::calculateVelocityStatistics(double static_vel_thresh,
             c.dyn_streak  = 0;
         }
 
-        // --- Determine Final Cell State based on Hysteresis (no changes) ---
+        // --- Determine Final Cell State based on Hysteresis ---
         if (!c.is_dynamic && c.dyn_streak >= need_on_frames) {
             c.is_dynamic = true;
         }
@@ -461,7 +557,7 @@ void DynamicGridMap::calculateVelocityStatistics(double static_vel_thresh,
             c.is_dynamic = false;
         }
 
-        // --- Update Dynamic Score (for visualization) (no changes) ---
+        // --- Update Dynamic Score (for visualization) ---
         const double target = c.is_dynamic ? std::min(1.0, speed / std::max(1e-6, max_vel_for_scaling)) : 0.0;
         const double alpha  = 0.6;
         c.dynamic_score = alpha * target + (1.0 - alpha) * c.dynamic_score;
@@ -481,7 +577,7 @@ void DynamicGridMap::calculateVelocityStatistics(double static_vel_thresh,
     }
 } // End of calculateVelocityStatistics
 
-// toOccupancyGridMsg (no changes)
+// [toOccupancyGridMsg] (no change)
 void DynamicGridMap::toOccupancyGridMsg(nav_msgs::OccupancyGrid& msg, const std::string& frame_id) const
 {
     msg.header.stamp = ros::Time::now();
@@ -504,7 +600,7 @@ void DynamicGridMap::toOccupancyGridMsg(nav_msgs::OccupancyGrid& msg, const std:
     }
 }
 
-// toMarkerArrayMsg (no changes)
+// [toMarkerArrayMsg] (no change)
 void DynamicGridMap::toMarkerArrayMsg(visualization_msgs::MarkerArray& arr,
                                       const std::string& frame_id,
                                       bool show_velocity_arrows) const
@@ -568,7 +664,7 @@ void DynamicGridMap::toMarkerArrayMsg(visualization_msgs::MarkerArray& arr,
                 p0.x = origin_x_ + (x + 0.5) * resolution_;
                 p0.y = origin_y_ + (y + 0.5) * resolution_;
                 p0.z = 0.00;
-                const double scale = 0.25;
+                const double scale = 0.5;
                 p1.x = p0.x + scale * c.mean_vx;
                 p1.y = p0.y + scale * c.mean_vy;
                 p1.z = 0.00;

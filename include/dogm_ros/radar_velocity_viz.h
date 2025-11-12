@@ -7,7 +7,10 @@
 #include <string>
 #include <pcl_conversions/pcl_conversions.h> // Include for PCL conversion
 #include <limits> // Include for numeric_limits
-
+// [NEW] Deque (양방향 큐) 헤더 추가 (버퍼로 사용)
+#include <deque> 
+// [NEW] PCL PointCloud 헤더 추가 (버퍼에 PCL 클라우드를 저장하기 위함)
+#include <pcl/point_cloud.h>
 // Include structure definitions (adjust path if necessary)
 #include "dogm_ros/structures.h"
 
@@ -42,7 +45,8 @@ private:
     std::string base_frame_;          // Frame ID for the markers
     double radar_viz_lifetime_;       // How long markers should persist in RViz (seconds)
     double radar_viz_color_max_vel_; // Speed (m/s) corresponding to the 'reddest' color
-
+    int viz_buffer_size_; // 몇 개의 스캔을 누적할지
+    std::deque<pcl::PointCloud<mmWaveCloudType>::Ptr> cloud_buffer_;
 };
 
 #endif // RADAR_VELOCITY_VIZ_H

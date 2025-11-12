@@ -43,7 +43,8 @@ public:
             use_mc_,
             use_radar_,
             lidar_hit_point_,       // [MODIFIED]
-            lidar_noise_stddev_     // [NEW]
+            lidar_noise_stddev_,     // [NEW]
+            mode_cluster_velocity_thresh_ // [NEW]
         );
 
         // Setup publishers for grid map and DOGM markers
@@ -189,8 +190,17 @@ private:
 
         // 5. Update grid cell occupancy
         grid_map_->updateOccupancy(birth_prob_);
+        
+        // --- [MODIFIED] Call order changed as per user request ---
 
-        // 6. Generate new particles
+        // 6. [NEW STEP 6] Calculate velocity statistics from (t-1) weighted survivors
+        // This now runs BEFORE resampling and birthing.
+        grid_map_->calculateVelocityStatistics(
+            static_velocity_threshold_, max_vel_for_scaling_,
+            use_ego_comp_, ego_vx_, ego_vy_
+        );
+
+        // 7. [NEW STEP 7] Generate new particles (which can now use the results from step 6)
         auto new_borns = grid_map_->generateNewParticles(
             newborn_vel_stddev_,
             min_dynamic_birth_ratio_, max_dynamic_birth_ratio_,
@@ -198,14 +208,12 @@ private:
             dynamic_newborn_vel_stddev_
         );
 
-        // 7. Resample particles
+        // 8. [NEW STEP 8] Resample (combines weighted survivors + weighted newborns)
         pf.resample(new_borns);
 
-        // 8. Calculate velocity statistics and classify cells
-        grid_map_->calculateVelocityStatistics(
-            static_velocity_threshold_, max_vel_for_scaling_,
-            use_ego_comp_, ego_vx_, ego_vy_
-        );
+        // 9. [OLD STEP 8] This logic is now at step 6.
+        // --- [END MODIFICATION] ---
+
 
         // 9. Publish results (OccupancyGrid and DOGM MarkerArray)
         nav_msgs::OccupancyGrid grid_msg;
@@ -245,6 +253,10 @@ private:
         pnh_.param("velocity_damping_threshold", velocity_damping_threshold_, 0.6);
         pnh_.param("velocity_damping_factor", velocity_damping_factor_, 0.2);
         pnh_.param("static_velocity_threshold", static_velocity_threshold_, 0.3);
+        
+        // [MODIFIED] Load the mode clustering threshold, with a stricter default (0.3)
+        pnh_.param("mode_cluster_velocity_thresh", mode_cluster_velocity_thresh_, 0.3);
+
         pnh_.param("radar_buffer_size", radar_buffer_size_, 5);
         pnh_.param("min_radar_points", min_radar_points_, 2);
         pnh_.param("radar_hint_search_radius", radar_hint_search_radius_, 2);
@@ -300,6 +312,7 @@ private:
     double dynamic_newborn_vel_stddev_;
     double velocity_damping_threshold_, velocity_damping_factor_;
     double static_velocity_threshold_, max_vel_for_scaling_;
+    double mode_cluster_velocity_thresh_; // [NEW]
     bool show_velocity_arrows_, use_ego_comp_;
     int radar_buffer_size_;
     int min_radar_points_;

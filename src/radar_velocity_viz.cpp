@@ -66,6 +66,7 @@ void RadarVizNode::loadParams()
     pnh_.param("base_frame", base_frame_, std::string("base_link")); // Default frame_id
     pnh_.param("radar_viz_lifetime", radar_viz_lifetime_, 0.5); // Default lifetime in seconds
     pnh_.param("radar_viz_color_max_vel", radar_viz_color_max_vel_, 1.5); // Default max speed for red color
+    pnh_.param("viz_buffer_size", viz_buffer_size_, 5);
 }
 
 // Callback function for incoming radar point clouds
@@ -75,6 +76,15 @@ void RadarVizNode::radarCb(const sensor_msgs::PointCloud2::ConstPtr& msg)
     pcl::PointCloud<mmWaveCloudType>::Ptr current_radar_cloud(new pcl::PointCloud<mmWaveCloudType>());
     pcl::fromROSMsg(*msg, *current_radar_cloud);
 
+    // --- [NEW] 버퍼에 최신 스캔 추가 ---
+    cloud_buffer_.push_back(current_radar_cloud);
+
+    // --- [NEW] 버퍼 크기가 파라미터보다 크면 가장 오래된 스캔 제거 ---
+    while (cloud_buffer_.size() > static_cast<size_t>(viz_buffer_size_))
+    {
+        cloud_buffer_.pop_front();
+    }
+    
     // Exit if no points in the cloud
     if (current_radar_cloud->points.empty()) {
         // Optional: Publish an empty marker to clear previous ones if needed
@@ -107,25 +117,23 @@ void RadarVizNode::radarCb(const sensor_msgs::PointCloud2::ConstPtr& msg)
     points_viz.lifetime = ros::Duration(radar_viz_lifetime_); // Set lifetime from parameter
     // --- End Marker Preparation ---
 
-    // Iterate through each point in the radar cloud
-    for (const auto& pt : current_radar_cloud->points) {
-        // Add point position to the marker
-        geometry_msgs::Point p;
-        p.x = pt.x; p.y = pt.y; p.z = 0.1; // Slightly above ground plane
-        points_viz.points.push_back(p);
+    for (const auto& cloud : cloud_buffer_)
+    {
+        // --- [MODIFIED] 해당 클라우드의 모든 포인트를 순회 ---
+        for (const auto& pt : cloud->points) {
+            // Add point position to the marker
+            geometry_msgs::Point p;
+            p.x = pt.x; p.y = pt.y; p.z = 0.1;
+            points_viz.points.push_back(p);
 
-        // Add color based on velocity using the rainbow mapping
-        std_msgs::ColorRGBA color;
-        color.a = 1.0; // Fully opaque
-        double r, g, b;
-        interpolateColor(pt.velocity, r, g, b); // Calculate color
-        color.r = r; color.g = g; color.b = b;
-        points_viz.colors.push_back(color);
-
-        // --- Update Min/Max Velocity (Optional) ---
-        if (pt.velocity < min_vel) min_vel = pt.velocity;
-        if (pt.velocity > max_vel) max_vel = pt.velocity;
-        // --- End Update Min/Max ---
+            // Add color based on velocity (원본 HSV 함수 사용)
+            std_msgs::ColorRGBA color;
+            color.a = 1.0;
+            double r, g, b;
+            interpolateColor(pt.velocity, r, g, b); // 원본 함수 호출
+            color.r = r; color.g = g; color.b = b;
+            points_viz.colors.push_back(color);
+        }
     }
     // Publish the visualization marker
     radar_viz_pub_.publish(points_viz);

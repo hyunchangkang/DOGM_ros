@@ -8,6 +8,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Compiler options (e.g., optimization)
 add_compile_options(-O2)
 
+# --- [NEW] Find OpenMP for parallelization ---
+find_package(OpenMP REQUIRED)
+# --- [END NEW] ---
+
 # Find necessary Catkin packages
 find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
@@ -33,7 +37,8 @@ catkin_package(
 
 # Specify include directories
 include_directories(
-  include                     # Package's own include directory
+  include                     
+# Package's own include directory
   ${catkin_INCLUDE_DIRS}    # Include directories from Catkin dependencies
   ${PCL_INCLUDE_DIRS}       # PCL include directories
 )
@@ -49,6 +54,7 @@ add_executable(dogm_node
 target_link_libraries(dogm_node
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
+  OpenMP::OpenMP_CXX # [NEW] Link OpenMP
 )
 # --- End DOGM Node ---
 
@@ -62,6 +68,7 @@ add_executable(radar_velocity_viz_node
 target_link_libraries(radar_velocity_viz_node
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
+  OpenMP::OpenMP_CXX # [NEW] Link OpenMP (Optional, but good practice)
 )
 # --- [END NEW] ---
 
@@ -73,7 +80,8 @@ install(TARGETS dogm_node radar_velocity_viz_node
 )
 
 # Install config, launch, and rviz files
-install(DIRECTORY config launch rviz
+install(DIRECTORY config 
+launch rviz
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 # --- End Installation ---

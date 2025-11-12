@@ -2,7 +2,7 @@
 #define DOGM_ROS_STRUCTURES_H
 
 #include <cstdint>
-#include <vector>
+#include <vector> // [MODIFIED] Include vector
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
 
@@ -39,11 +39,10 @@ struct Particle {
 
 /**
  * @struct RadarPoint
- * @brief [MODIFIED] Stores raw 1D velocity (vr) and direction (x, y)
+ * @brief [NEW] Stores raw 1D velocity (vr) and direction (x, y)
  */
 struct RadarPoint
 {
-    // double speed; // [REMOVED]
     double radial_velocity; // Raw vr (+/-)
     double x;               // Position for direction calculation
     double y;               // Position for direction calculation
@@ -64,28 +63,47 @@ struct GridCell {
     // 동적 판정 & 시각화
     bool   is_dynamic{false};
     double dynamic_score{0.0};
-    double mahalanobis_dist{0.0};
+    double mahalanobis_dist{0.0}; // (Original DOGM, can be repurposed)
 
     // 히스테리시스용 연속 프레임 카운트
     std::uint8_t dyn_streak{0};
     std::uint8_t stat_streak{0};
     
     // --- [MODIFIED] Radar 1D Hint ---
-    // double radar_speed_hint{0.0}; // [REMOVED]
-    double radar_vr_hint{0.0};      // Time-filtered 1D range_rate (+/-)
+    double radar_vr_hint{0.0};      // Time-filtered 1D range_rate (+/-) (단일 셀의 시간 평균)
     double radar_theta_hint{0.0};   // Time-filtered 1D direction (angle)
+    
+    // [OPTIMIZATION] Pre-computed trigonometric values
+    double radar_cos_theta{1.0};    // cos(radar_theta_hint)
+    double radar_sin_theta{0.0};    // sin(radar_theta_hint)
     // ---------------------------------
 
-    bool has_reliable_radar{false};
-    std::vector<RadarPoint> radar_points_buffer;
+    bool has_reliable_radar{false}; // True if buffer has enough points
+    std::vector<RadarPoint> radar_points_buffer; // [NEW] Buffer for temporal averaging
 
     // [NEW] For False Static Detection
     std::uint8_t free_streak{0}; 
 };
 
 struct MeasurementCell {
-    double m_occ_z{0.0};  // 측정 점유 질량
-    double m_free_z{0.0}; // 측정 free 질량
+    // [REMOVED] m_occ_z is replaced by the continuous model below
+    // double m_occ_z{0.0};  
+    
+    double m_free_z{0.0}; // 측정 free 질량 (Still used)
+
+    // --- [NEW] LiDAR Likelihood Model Parameters ---
+    // (μ, Σ⁻¹) calculated in generateMeasurementGrid
+    bool   has_lidar_model{false}; // True if this cell has a valid model
+    
+    // Mean (μ)
+    double mean_x{0.0};
+    double mean_y{0.0};
+
+    // Pre-calculated Inverse Covariance Matrix (Σ⁻¹)
+    double inv_cov_xx{0.0};
+    double inv_cov_xy{0.0};
+    double inv_cov_yy{0.0};
+    // --- [END NEW] ---
 };
 
 #endif // DOGM_ROS_STRUCTURES_H

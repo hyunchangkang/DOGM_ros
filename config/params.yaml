@@ -14,8 +14,8 @@ odom_topic: "/odometry/filtered"                      # Topic for nav_msgs/Odome
 # 2. Grid Map & Filter Base Settings
 # -------------------------------------------------------------------
 grid_size: 3.0                           # Total width/height of the square grid map (meters)
-grid_resolution: 0.10                    # Size of a single grid cell (meters)
-filter_update_rate: 10.0                  # Main filter loop frequency (Hz)
+grid_resolution: 0.15                    # Size of a single grid cell (meters)
+filter_update_rate: 10.0                 # Main filter loop frequency (Hz)
 
 # [NEW] Minimum LiDAR hits in a cell to be considered a 'reliable' source
 # for spreading the Likelihood Field. (Noise filter)
@@ -23,8 +23,8 @@ lidar_hit_point: 5
 
 # 3. Particle Filter & Process Model (Core Algorithm)
 # -------------------------------------------------------------------
-num_particles: 5000                     # Total number of particles used by the filter
-max_velocity: 3                          # Maximum speed a particle can have (m/s)
+num_particles: 10000                      # Total number of particles used by the filter
+max_velocity: 2                          # Maximum speed a particle can have (m/s)
 process_noise_pos: 0.03                  # Stddev for position "random walk" in predict step (m)
 process_noise_vel: 0.05                  # Stddev for velocity "random walk" in predict step (m/s)
 
@@ -60,6 +60,11 @@ velocity_damping_factor: 0.2             # How much to slow down (0.2 = 80% redu
 #
 static_velocity_threshold: 0.3
 
+# [MODIFIED] Threshold (m/s) for mode-clustering velocity calculation.
+# Particles with velocity difference > this from the "winner" are ignored.
+# Stricter threshold (0.3) to better separate different modes (e.g., 0.8 m/s vs 1.2 m/s).
+mode_cluster_velocity_thresh: 0.2
+
 # 6. Radar Sensor Fusion (Key parameters)
 # -------------------------------------------------------------------
 use_radar: true                         # Master toggle for all radar fusion logic
@@ -75,7 +80,7 @@ min_radar_points: 2
 # Radius for *spatial* smoothing (borrowing hints from neighbors).
 # 3 means it checks a 7x7 (49-cell) area around the target cell.
 #
-radar_hint_search_radius: 2
+radar_hint_search_radius: 1
 
 # --- Birth Ratio Scaling (Your Question) ---
 # Default ratio of dynamic particles if NO RADAR HINT is found. (e.g., 10%)
@@ -102,7 +107,7 @@ radar_noise_stddev: 0.4
 # [NEW] Stddev for Lidar Likelihood Field (m)
 # The 'stddev' (size of the "ink stamp") for the L_lidar model.
 #
-lidar_noise_stddev: 0.05
+lidar_noise_stddev: 0.03
 
 # [MODIFIED] Renamed and changed to a POSITIVE value.
 # Controls how strongly moving particles are penalized when no radar hint
@@ -124,7 +129,7 @@ use_measurement_correction: true
 #
 use_false_static_detection: true
 fsd_T_static: 2 
-fsd_T_free: 5   
+fsd_T_free: 3   
 
 # 7. Misc / Visualization
 # -------------------------------------------------------------------
