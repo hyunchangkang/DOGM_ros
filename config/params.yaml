@@ -1,5 +1,5 @@
 # ===================================================================
-# dogm_ros parameter file (Annotated Version)
+# dogm_ros parameter file (Simplified & Re-ordered)
 # ===================================================================
 
 # 1. ROS Topics & Coordinate Frames
@@ -9,133 +9,88 @@ radar_topic: "/ti_mmwave/radar_scan_pcl_0" # Topic for sensor_msgs/PointCloud2 (
 grid_topic: "/dogm/grid"                 # Topic for nav_msgs/OccupancyGrid output
 marker_topic: "/dogm/markers"            # Topic for visualization_msgs/MarkerArray (cells and arrows)
 base_frame: "base_link"                  # Robot's base frame (for calculating grid position)
-odom_topic: "/odometry/filtered"                      # Topic for nav_msgs/Odometry (for ego-motion compensation)
+odom_topic: "/odometry/filtered"         # Topic for nav_msgs/Odometry (for ego-motion compensation)
 
 # 2. Grid Map & Filter Base Settings
 # -------------------------------------------------------------------
 grid_size: 3.0                           # Total width/height of the square grid map (meters)
 grid_resolution: 0.15                    # Size of a single grid cell (meters)
 filter_update_rate: 10.0                 # Main filter loop frequency (Hz)
-
-# [NEW] Minimum LiDAR hits in a cell to be considered a 'reliable' source
-# for spreading the Likelihood Field. (Noise filter)
-lidar_hit_point: 5
-
-# 3. Particle Filter & Process Model (Core Algorithm)
-# -------------------------------------------------------------------
-num_particles: 10000                      # Total number of particles used by the filter
+num_particles: 10000                     # Total number of particles used by the filter
 max_velocity: 2                          # Maximum speed a particle can have (m/s)
-process_noise_pos: 0.03                  # Stddev for position "random walk" in predict step (m)
-process_noise_vel: 0.05                  # Stddev for velocity "random walk" in predict step (m/s)
 
-# Probability that a particle survives to the next time step.
-#
-persistence_prob: 0.99
+# ===================================================================
+# 3. Main Filter Loop (Algorithm Step-by-Step)
+# ===================================================================
 
-# Probability of a new object "birthing" in a previously unknown cell.
-# Used in updateOccupancy to calculate newborn mass 'rho_b'.
-#
+# 3.1. Step 1: Measurement Model (generateMeasurementGrid)
+# -------------------------------------------------------------------
+use_radar: true                          # Master toggle for all radar fusion logic
+lidar_hit_point: 5                       # Min LiDAR hits to build a model (in generateMeasurementGrid)
+lidar_noise_stddev: 0.03                 # Stddev for Lidar Likelihood Field (in generateMeasurementGrid)
+radar_buffer_size: 3                     # Frames to buffer radar points (in generateMeasurementGrid)
+min_radar_points: 2                      # Min points in buffer for a hint (in generateMeasurementGrid)
+
+# 3.2. Step 2: Particle Prediction (predict)
+# -------------------------------------------------------------------
+process_noise_pos: 0.03                   # Position noise stddev (in predict)
+process_noise_vel: 0.15                  # Velocity noise stddev (in predict)
+persistence_prob: 0.99                   # Particle survival probability (in predict)
+velocity_damping_threshold: 0.2          # Speed threshold to start damping (in predict)
+velocity_damping_factor: 0.2             # How much to slow down (0.2 = 80% reduction) (in predict)
+
+# 3.3. Step 3: Weight Update (updateWeights)
+# -------------------------------------------------------------------
+# Stddev for Radar Likelihood PDF (in updateWeights)
+radar_noise_stddev: 1.0
+# (radar_static_penalty_strength was removed)
+
+# 3.4. Step 4: Occupancy Update (updateOccupancy)
+# -------------------------------------------------------------------
+# Probability of a new object "birthing" in unknown space (in updateOccupancy)
 birth_prob: 0.02
 
-# 4. New Particle Generation (The part we discussed)
+# 3.5. Step 5: Cell Classification (calculateVelocityStatistics)
 # -------------------------------------------------------------------
-# Stddev for velocity of *static* newborn particles. (Should be low, centered at 0)
-#
-newborn_vel_stddev: 0.3
+# Threshold for CLEAN (clustered) particle velocity (in calculateVelocityStatistics)
+particle_static_velocity_threshold: 0.2
+# Threshold for RAW (noisy) radar velocity (in calculateVelocityStatistics)
+radar_static_velocity_threshold: 0.2
+# Speed difference threshold for mode-clustering (in calculateVelocityStatistics)
+mode_cluster_velocity_thresh: 0.2
+# Search radius for smoothing radar hints (in getSmoothedRadarVrHint)
+radar_hint_search_radius: 2
+# Use Measurement Correction safety net (in calculateVelocityStatistics)
+use_measurement_correction: true
+# Use False Static Detection safety net (in calculateVelocityStatistics)
+use_false_static_detection: true
+fsd_T_static: 2                          # FSD: Min frames to be static
+fsd_T_free: 3                            # FSD: Min preceding free frames
 
-# Stddev for velocity of *dynamic* newborn particles. (Should be high, for diverse speed guesses)
-#
+# 3.6. Step 6: Particle Generation (generateNewParticles)
+# (This is the independent "bootstrap" logic)
+# -------------------------------------------------------------------
+# Ratio if NO radar hint is found (in generateNewParticles)
+min_dynamic_birth_ratio: 0.3  #0.1
+# Ratio if a STRONG radar hint is found (in generateNewParticles)
+max_dynamic_birth_ratio: 0.9  
+# The radar speed (m/s) at which the ratio scales to the maximum (in generateNewParticles)
+max_radar_speed_for_scaling: 0.001  #1.0 없앨 예정
+
+# Stddev for *static* newborn particle velocity (in generateNewParticles)
+newborn_vel_stddev: 0.3
+# Stddev for *dynamic* newborn particle velocity (fallback) (in generateNewParticles)
 dynamic_newborn_vel_stddev: 1.5
 
-# 5. Velocity Damping & Classification
+# 3.7. Step 7: Resampling (resample)
 # -------------------------------------------------------------------
-# If a particle's speed drops below this, it gets artificially slowed down.
-# Helps remove dynamic particles from objects that have stopped.
-#
-velocity_damping_threshold: 0.2
-velocity_damping_factor: 0.2             # How much to slow down (0.2 = 80% reduction)
+# (No parameters for this step, num_particles is used)
 
-# The FINAL threshold. If a cell's average particle speed is above this,
-# 'has_speed_from_particles' becomes true.
-#
-static_velocity_threshold: 0.3
 
-# [MODIFIED] Threshold (m/s) for mode-clustering velocity calculation.
-# Particles with velocity difference > this from the "winner" are ignored.
-# Stricter threshold (0.3) to better separate different modes (e.g., 0.8 m/s vs 1.2 m/s).
-mode_cluster_velocity_thresh: 0.2
-
-# 6. Radar Sensor Fusion (Key parameters)
-# -------------------------------------------------------------------
-use_radar: true                         # Master toggle for all radar fusion logic
-
-# 6a. Radar Hint Generation (Temporal & Spatial Smoothing)
-# How many frames a radar point is kept in a cell's buffer.
-#
-radar_buffer_size: 3
-# Minimum points needed in the buffer to create a reliable 'radar_vr_hint'.
-#
-min_radar_points: 2
-
-# Radius for *spatial* smoothing (borrowing hints from neighbors).
-# 3 means it checks a 7x7 (49-cell) area around the target cell.
-#
-radar_hint_search_radius: 1
-
-# --- Birth Ratio Scaling (Your Question) ---
-# Default ratio of dynamic particles if NO RADAR HINT is found. (e.g., 10%)
-# This implies "Assume Static" philosophy.
-#
-min_dynamic_birth_ratio: 0.1
-
-# Maximum ratio of dynamic particles if a STRONG RADAR HINT is found. (e.g., 90%)
-#
-max_dynamic_birth_ratio: 0.9
-
-# The radar speed (m/s) at which the ratio scales to the maximum.
-# (e.g., speed=0.5 -> 50% scale, speed=1.0 -> 100% scale -> 90% dynamic ratio)
-#
-max_radar_speed_for_scaling: 1.0 
-
-# 6b. Radar Weight Update (in particle_filter.cpp)
-# The 'stddev' (size of the "trust zone") for the 'radar_likelihood'.
-# Smaller = stricter, particle speed must match radar speed exactly.
-# Larger = looser, allows for more error.
-#
-radar_noise_stddev: 0.4
-
-# [NEW] Stddev for Lidar Likelihood Field (m)
-# The 'stddev' (size of the "ink stamp") for the L_lidar model.
-#
-lidar_noise_stddev: 0.03
-
-# [MODIFIED] Renamed and changed to a POSITIVE value.
-# Controls how strongly moving particles are penalized when no radar hint
-# is present (static assumption).
-# Higher value = stronger penalty.
-#
-radar_static_penalty_strength: 0.5 # (Old: radar_absent_penalty_factor: -0.5)
-
-# 6c. Safety Net 1: Measurement Correction (Handles crossing objects)
-# If particles show speed but radar shows 0 (crossing object),
-# this forces a 'dynamic' classification.
-#
-use_measurement_correction: true
-
-# 6d. Safety Net 2: False Static Detection (Handles slow walkers)
-# If an object is 'static' for 'fsd_T_static' frames but was 'free'
-# 'fsd_T_free' frames before that, it's likely a slow-starting
-# dynamic object. Force dynamic classification.
-#
-use_false_static_detection: true
-fsd_T_static: 2 
-fsd_T_free: 3   
-
-# 7. Misc / Visualization
+# 4. Misc / Visualization
 # -------------------------------------------------------------------
 show_velocity_arrows: true               # Toggle for RViz velocity markers
 use_ego_comp: true                       # Compensate for robot's own movement
 max_velocity_for_scaling: 2.0            # Max speed for coloring RViz markers
-
 show_ego_velocity_arrow: true
 ego_vel_marker_topic: "/dogm/ego_velocity_arrow"

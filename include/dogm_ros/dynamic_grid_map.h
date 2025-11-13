@@ -18,7 +18,6 @@
 class DynamicGridMap {
 public:
     // Constructor
-    // [MODIFIED] Signature changed for new Lidar model AND mode clustering
     DynamicGridMap(double grid_size, double resolution, int num_particles,
                    double process_noise_pos, double process_noise_vel,
                    int radar_buffer_size, int min_radar_points,
@@ -26,13 +25,14 @@ public:
                    bool use_fsd, int fsd_T_static, int fsd_T_free,
                    bool use_mc,
                    bool use_radar,
-                   int lidar_hit_point,         // [MODIFIED]
-                   double lidar_noise_stddev, // [NEW]
-                   double mode_cluster_velocity_thresh); // [NEW]
+                   int lidar_hit_point,
+                   double lidar_noise_stddev,
+                   double mode_cluster_velocity_thresh,
+                   double particle_static_vel_thresh, // new
+                   double radar_static_vel_thresh);    // new
     ~DynamicGridMap() = default; // Default destructor
 
     // Generates the measurement grid based on sensor inputs
-    // [MODIFIED] Now generates (μ, Σ⁻¹) model instead of m_occ_z
     void generateMeasurementGrid(const sensor_msgs::LaserScan::ConstPtr& scan,
                                  const pcl::PointCloud<mmWaveCloudType>::ConstPtr& radar_cloud);
 
@@ -40,7 +40,7 @@ public:
     void updateOccupancy(double birth_prob);
 
     // Generates new particles for cells with high birth probability
-    // [MODIFIED] Now uses cell's mean_vx/mean_vy to guide new particle direction
+    // Signature reverted to include max_radar_speed_for_scaling
     std::vector<Particle> generateNewParticles(double newborn_vel_stddev,
                                                double min_dynamic_birth_ratio,
                                                double max_dynamic_birth_ratio,
@@ -48,9 +48,7 @@ public:
                                                double dynamic_newborn_vel_stddev);
 
     // Calculates velocity statistics from particles and classifies cells
-    // [MODIFIED] This now runs BEFORE resampling
-    void calculateVelocityStatistics(double static_vel_thresh,
-                                     double max_vel_for_scaling,
+    void calculateVelocityStatistics(double max_vel_for_scaling,
                                      bool   use_ego_comp,
                                      double ego_vx, double ego_vy);
 
@@ -71,53 +69,56 @@ public:
     bool worldToGrid(double wx, double wy, int& gx, int& gy) const;
     void gridToWorld(int gx, int gy, double& wx, double& wy) const;
     int gridToIndex(int gx, int gy) const;
-    void indexToGrid(int idx, int& gx, int& gy) const; // [NEW] Helper function
+    void indexToGrid(int idx, int& gx, int& gy) const;
     bool isInside(int gx, int gy) const;
 
-    // [MODIFIED] Public helper for particle filter (for L_Radar smoothing)
-    // Calculates a spatially smoothed 1D radar velocity hint
+    // Public helper for particle filter (for L_Radar smoothing)
     bool getSmoothedRadarVrHint(int center_gx, int center_gy, double& smoothed_vr_hint) const;
 
 
 private:
     // Grid map properties
-    double grid_size_;        // Size of one side of the square grid (meters)
-    double resolution_;       // Size of one cell (meters/cell)
-    int grid_width_;          // Number of cells along width
-    int grid_height_;         // Number of cells along height
-    double origin_x_;         // X coordinate of the grid origin (bottom-left corner)
-    double origin_y_;         // Y coordinate of the grid origin (bottom-left corner)
+    double grid_size_;
+    double resolution_;
+    int grid_width_;
+    int grid_height_;
+    double origin_x_;
+    double origin_y_;
 
     // Grid data storage
-    std::vector<GridCell> grid_;             // Stores the state of each cell (DS masses, velocity, etc.)
-    std::vector<MeasurementCell> measurement_grid_; // Stores the latest sensor measurements (m_free_z, lidar model)
+    std::vector<GridCell> grid_;
+    std::vector<MeasurementCell> measurement_grid_;
 
     // Particle filter instance
     std::unique_ptr<ParticleFilter> particle_filter_;
 
     // Random number generator
-    std::mt19937 random_generator_; // [MODIFIED] Corrected typo
+    std::mt19937 random_generator_;
 
     // Radar processing parameters
-    int radar_buffer_size_;      // How many frames to keep radar points in buffer
-    int min_radar_points_;       // Minimum radar points required for a reliable hint
-    int radar_hint_search_radius_; // Neighborhood size for smoothing radar hint
+    int radar_buffer_size_;
+    int min_radar_points_;
+    int radar_hint_search_radius_;
 
     // Safety Net Parameters
-    bool use_fsd_;            // Flag to enable/disable False Static Detection
-    int fsd_T_static_;        // Threshold for static frames in FSD
-    int fsd_T_free_;          // Threshold for preceding free frames in FSD
-    bool use_mc_;             // Flag to enable/disable Measurement Correction
+    bool use_fsd_;
+    int fsd_T_static_;
+    int fsd_T_free_;
+    bool use_mc_;
 
     // General flags
-    bool use_radar_;          // Flag indicating if radar fusion is active
+    bool use_radar_;
 
-    // [MODIFIED] LiDAR processing parameters
-    int    lidar_hit_point_;    // [MODIFIED] Minimum LiDAR hits to create a likelihood source
-    double lidar_noise_stddev_; // [NEW] Stddev for Lidar Likelihood Field (m)
+    // LiDAR processing parameters
+    int    lidar_hit_point_;
+    double lidar_noise_stddev_;
 
-    // [NEW] Velocity clustering
-    double mode_cluster_velocity_thresh_sq_; // [NEW] Squared threshold for mode clustering
+    // Velocity clustering
+    double mode_cluster_velocity_thresh_sq_;
+    
+    // Dual Thresholds
+    double particle_static_vel_thresh_;
+    double radar_static_vel_thresh_;
 };
 
 #endif // DYNAMIC_GRID_MAP_H
