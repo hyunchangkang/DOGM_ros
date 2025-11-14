@@ -16,7 +16,7 @@ odom_topic: "/odometry/filtered"         # Topic for nav_msgs/Odometry (for ego-
 grid_size: 3.0                           # Total width/height of the square grid map (meters)
 grid_resolution: 0.15                    # Size of a single grid cell (meters)
 filter_update_rate: 10.0                 # Main filter loop frequency (Hz)
-num_particles: 10000                     # Total number of particles used by the filter
+num_particles: 10000                   # Total number of particles used by the filter
 max_velocity: 2                          # Maximum speed a particle can have (m/s)
 
 # ===================================================================
@@ -43,7 +43,7 @@ velocity_damping_factor: 0.2             # How much to slow down (0.2 = 80% redu
 # -------------------------------------------------------------------
 # Stddev for Radar Likelihood PDF (in updateWeights)
 radar_noise_stddev: 1.0
-# (radar_static_penalty_strength was removed)
+# (radar_static_penalty_strength was sremoved)
 
 # 3.4. Step 4: Occupancy Update (updateOccupancy)
 # -------------------------------------------------------------------
@@ -71,11 +71,11 @@ fsd_T_free: 3                            # FSD: Min preceding free frames
 # (This is the independent "bootstrap" logic)
 # -------------------------------------------------------------------
 # Ratio if NO radar hint is found (in generateNewParticles)
-min_dynamic_birth_ratio: 0.3  #0.1
+min_dynamic_birth_ratio: 0.3  # static 70% / dynamic 30%
 # Ratio if a STRONG radar hint is found (in generateNewParticles)
-max_dynamic_birth_ratio: 0.9  
+max_dynamic_birth_ratio: 0.9  # static 10% / dynamic 90%
 # The radar speed (m/s) at which the ratio scales to the maximum (in generateNewParticles)
-max_radar_speed_for_scaling: 0.001  #1.0 없앨 예정
+max_radar_speed_for_scaling: 1.0  #1.0 없앨 예정
 
 # Stddev for *static* newborn particle velocity (in generateNewParticles)
 newborn_vel_stddev: 0.3

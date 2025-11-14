@@ -656,7 +656,7 @@ void DynamicGridMap::toMarkerArrayMsg(visualization_msgs::MarkerArray& arr,
                 p0.x = origin_x_ + (x + 0.5) * resolution_;
                 p0.y = origin_y_ + (y + 0.5) * resolution_;
                 p0.z = 0.00;
-                const double scale = 0.5;
+                const double scale = 0.4;
                 p1.x = p0.x + scale * c.mean_vx;
                 p1.y = p0.y + scale * c.mean_vy;
                 p1.z = 0.00;
