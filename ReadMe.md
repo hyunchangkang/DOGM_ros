@@ -86,16 +86,27 @@ This function acts as the sensor pre-processing stage.
 -   **Radar Processing**: It maintains a time-averaged buffer of radar detections for each cell. If a cell has enough recent radar points (`min_radar_points`), it calculates a time-averaged radial velocity hint ($v_{r, \text{hint}}$) and the corresponding angle ($\theta_c$). This hint provides crucial kinematic information.
 
 #### 2. `predict` (in `particle_filter.cpp`)
-This is the prediction step of the particle filter. Each particle's state (position and velocity) is propagated forward in time based on a constant velocity model, with random noise added to account for process uncertainty. The new position is calculated from the old position and velocity, and the new velocity is based on the old velocity, both with added noise.
+This is the prediction step of the particle filter. Each particle's state (position and velocity) is propagated forward in time based on a constant velocity model, with random noise added to account for process uncertainty.
+$
+\begin{aligned}
+\mathbf{x}_{p}^{(t)} &= \mathbf{x}_{p}^{(t-1)} + \mathbf{v}_{p}^{(t-1)} \cdot \Delta t + \mathcal{N}(0, \sigma_{\text{pos}}^2) \\
+\mathbf{v}_{p}^{(t)} &= \mathbf{v}_{p}^{(t-1)} + \mathcal.N}(0, \sigma_{\text{vel}}^2)
+\end{aligned}
+$
 
 #### 3. `updateWeights` (in `particle_filter.cpp`)
-This is the core of the "survival" process, where each particle's weight is updated based on how well its state matches the sensor measurements. The new weight is the product of the previous weight and two likelihoods: `Weight_new = Weight_old * L_LiDAR * L_Radar`.
+This is the core of the "survival" process, where each particle's weight is updated based on how well its state matches the sensor measurements. The new weight is the product of the previous weight and two likelihoods:
 
--   **LiDAR Likelihood ($L_{\text{LiDAR}}$)**: This term evaluates the geometric consistency. It measures the probability of a particle's position given the LiDAR measurement model of the cell it occupies, using a multivariate Gaussian probability density function. In essence, it checks if the particle is located where the LiDAR sensor detected an object.
+$w_p^{(t)} \propto w_p^{(t-1)} \cdot L_{\text{LiDAR}} \cdot L_{\text{Radar}}$
 
--   **Radar Likelihood ($L_{\text{Radar}}$)**: This term evaluates the kinematic consistency. It compares the particle's predicted radial velocity to the smoothed radar velocity hint for that cell. This checks if the particle is moving at a velocity consistent with what the radar sensor detected.
+-   **LiDAR Likelihood ($L_{\text{LiDAR}}$)**: This term evaluates the geometric consistency. It measures the probability of a particle's position ($\mathbf{x}_p$) given the LiDAR measurement model of the cell it occupies, using a multivariate Gaussian probability density function.
+    $L_{\text{LiDAR}} \propto \exp\left(-\frac{1}{2} (\mathbf{x}_p - \boldsymbol{\mu}_c)^T \boldsymbol{\Sigma}_c^{-1} (\mathbf{x}_p - \boldsymbol{\mu}_c)\right)$
 
-If a cell has no radar hint, `L_Radar` is treated as 1.0, meaning the weight update relies solely on LiDAR data. This prevents penalizing particles in areas without radar coverage.
+-   **Radar Likelihood ($L_{\text{Radar}}$)**: This term evaluates the kinematic consistency. It compares the particle's predicted radial velocity ($v_{r, \text{guess}}$) to the smoothed radar velocity hint ($v_{r, \text{hint}}$) for that cell.
+    $L_{\text{Radar}} = \exp\left(-\frac{(v_{r, \text{guess}} - v_{r, \text{hint}})^2}{2\sigma_{\text{radar}}^2}\right)$
+    where $v_{r, \text{guess}} = \mathbf{v}_p \cdot [\cos(\theta_c), \sin(\theta_c)]^T$.
+
+If a cell has no radar hint, $L_{\text{Radar}}$ is treated as 1.0, meaning the weight update relies solely on LiDAR data. This prevents penalizing particles in areas without radar coverage.
 
 #### 4. `calculateVelocityStatistics` (in `dynamic_grid_map.cpp`)
 This function performs the final state estimation and classification for each cell based on the weighted "surviving" particles within it.
