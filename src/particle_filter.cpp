@@ -1,9 +1,9 @@
 #include "dogm_ros/particle_filter.h"
-#include "dogm_ros/dynamic_grid_map.h" // Needed for getSmoothedRadarVrHint
+#include "dogm_ros/dynamic_grid_map.h"
 #include <algorithm>
 #include <numeric>
 #include <cmath>
-#include <omp.h> // Include OpenMP header
+#include <omp.h>
 
 ParticleFilter::ParticleFilter(int num_particles, double process_noise_pos, double process_noise_vel)
     : num_particles_(num_particles),
@@ -20,10 +20,11 @@ ParticleFilter::ParticleFilter(int num_particles, double process_noise_pos, doub
     }
 }
 
-// [predict] (Parallelized)
+// [수정] predict 함수: 가속도(d_ego_vx) 반영
 void ParticleFilter::predict(double dt, double survival_prob,
                              double damping_thresh, double damping_factor,
-                             double max_vel)
+                             double max_vel,
+                             double d_ego_vx, double d_ego_vy) 
 {
     const int GRACE_PERIOD = 3;
 
@@ -31,6 +32,11 @@ void ParticleFilter::predict(double dt, double survival_prob,
     for (int i = 0; i < particles_.size(); ++i)
     {
         auto& p = particles_[i];
+        
+        // [핵심] 로봇이 가속하면(+), 물체는 상대적으로 더 빨리 다가오거나 멀어짐(-)
+        // 관성을 보정하기 위해 속도 변화량을 빼줌
+        p.vx -= d_ego_vx;
+        p.vy -= d_ego_vy;
         
         double pos_noise_x, pos_noise_y, vel_noise_x, vel_noise_y;
         #pragma omp critical (random_gen)
@@ -41,6 +47,7 @@ void ParticleFilter::predict(double dt, double survival_prob,
             vel_noise_y = vel_noise_dist_(random_generator_);
         }
         
+        // 위치 업데이트 (상대 속도 기준)
         p.x += p.vx * dt + pos_noise_x;
         p.y += p.vy * dt + pos_noise_y;
 
@@ -65,15 +72,9 @@ void ParticleFilter::predict(double dt, double survival_prob,
     }
 }
 
-/**
- * @brief Updates weights using:
- * 1. Continuous 2D Gaussian PDF for L_LiDAR.
- * 2. Spatially-Smoothed (radar_search_radius) hint for L_Radar.
- * 3. OpenMP parallelization.
- */
 void ParticleFilter::updateWeights(const std::vector<MeasurementCell>& measurement_grid,
                                    const std::vector<GridCell>& grid,
-                                   const DynamicGridMap& grid_map, // Used for getSmoothedRadarVrHint
+                                   const DynamicGridMap& grid_map,
                                    double radar_noise_stddev)
 {
     double total_weight = 0.0;
@@ -89,28 +90,20 @@ void ParticleFilter::updateWeights(const std::vector<MeasurementCell>& measureme
         {
             if (p.grid_cell_idx >= 0 && p.grid_cell_idx < measurement_grid.size())
             {
-                // 1. LiDAR Likelihood (Geometric verification)
                 const auto& meas_cell = measurement_grid[p.grid_cell_idx];
                 double lidar_likelihood;
 
                 if (meas_cell.has_lidar_model) {
-                    // This cell has a valid (μ, Σ⁻¹) model calculated from hits
                     double dx = p.x - meas_cell.mean_x;
                     double dy = p.y - meas_cell.mean_y;
-
-                    // (x-μ)' * Σ⁻¹ * (x-μ)
                     double zx = dx * meas_cell.inv_cov_xx + dy * meas_cell.inv_cov_xy;
                     double zy = dx * meas_cell.inv_cov_xy + dy * meas_cell.inv_cov_yy;
                     double mahal_dist_sq = zx * dx + zy * dy;
-
-                    // L ∝ exp(-0.5 * mahal_dist_sq)
                     lidar_likelihood = std::exp(-0.5 * mahal_dist_sq);
                 } else {
-                    // No valid model (empty space, etc.)
                     lidar_likelihood = 1e-9; 
                 }
 
-                // 2. Radar Likelihood (Kinematic verification)
                 double radar_likelihood = 1.0; 
                 const auto& grid_cell = grid[p.grid_cell_idx];
 
@@ -120,7 +113,6 @@ void ParticleFilter::updateWeights(const std::vector<MeasurementCell>& measureme
 
                 if (grid_map.getSmoothedRadarVrHint(gx, gy, smoothed_vr_hint))
                 {
-                    // --- Case 1: Spatially-Smoothed hint exists ---
                     const double vr_guess = p.vx * grid_cell.radar_cos_theta + 
                                            p.vy * grid_cell.radar_sin_theta;
                     const double error = vr_guess - smoothed_vr_hint;
@@ -128,37 +120,25 @@ void ParticleFilter::updateWeights(const std::vector<MeasurementCell>& measureme
                 }
                 else 
                 {
-                    // --- Case 2: No hint in neighborhood ---
-                    // "No information" is treated as "neutral" (1.0).
-                    // This prevents penalizing particles (e.g., crossing) in
-                    // areas without radar coverage.
                     radar_likelihood = 1.0;
                 }
 
-                // 3. Combine Likelihoods
                 p.weight *= (lidar_likelihood * radar_likelihood);
             }
             else
             {
-                p.weight *= 0.01; // Particle is outside the grid
+                p.weight *= 0.01; 
             }
         }
-        
         total_weight += p.weight;
-    } // --- End of parallel loop ---
+    }
 
-    // Normalize total weights (done in serial after the parallel loop)
     if (total_weight > 1e-9)
     {
-        for (auto& p : particles_)
-        {
-            p.weight /= total_weight;
-        }
+        for (auto& p : particles_) p.weight /= total_weight;
     }
 }
 
-
-// [sortParticlesByGridCell] (Parallelized)
 void ParticleFilter::sortParticlesByGridCell(const DynamicGridMap& grid_map)
 {
     #pragma omp parallel for
@@ -176,14 +156,12 @@ void ParticleFilter::sortParticlesByGridCell(const DynamicGridMap& grid_map)
         }
     }
 
-    // Serial sort is kept for simplicity.
     std::sort(particles_.begin(), particles_.end(),
               [](const Particle& a, const Particle& b) {
                   return a.grid_cell_idx < b.grid_cell_idx;
               });
 }
 
-// [resample] (no change)
 void ParticleFilter::resample(const std::vector<Particle>& new_born_particles)
 {
     std::vector<Particle> combined_pool;
@@ -197,29 +175,18 @@ void ParticleFilter::resample(const std::vector<Particle>& new_born_particles)
     }
 
     double total_weight = 0.0;
-    for (const auto& p : combined_pool)
-    {
-        total_weight += p.weight;
-    }
+    for (const auto& p : combined_pool) total_weight += p.weight;
 
-    if (total_weight < 1e-9)
-    {
-        for (auto& p : combined_pool) {
-            p.weight = 1.0 / combined_pool.size();
-        }
+    if (total_weight < 1e-9) {
+        for (auto& p : combined_pool) p.weight = 1.0 / combined_pool.size();
         total_weight = 1.0;
-    }
-    else
-    {
-        for (auto& p : combined_pool) {
-            p.weight /= total_weight;
-        }
+    } else {
+        for (auto& p : combined_pool) p.weight /= total_weight;
     }
 
     std::vector<Particle> new_particle_set;
     new_particle_set.reserve(num_particles_);
 
-    // Low Variance Resampling (LVR)
     std::uniform_real_distribution<double> dist(0.0, 1.0 / num_particles_);
     double r = dist(random_generator_); 
     double c = combined_pool[0].weight;
@@ -241,9 +208,6 @@ void ParticleFilter::resample(const std::vector<Particle>& new_born_particles)
 
     if (!particles_.empty()) {
         double uniform_weight = 1.0 / particles_.size();
-        for (auto& p : particles_)
-        {
-            p.weight = uniform_weight;
-        }
+        for (auto& p : particles_) p.weight = uniform_weight;
     }
 }

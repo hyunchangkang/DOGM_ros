@@ -10,43 +10,6 @@
 - **Velocity Estimation**: Estimates the velocity and direction of dynamic cells.
 - **Particle Filter**: Implements a survival-birth particle filter for state estimation.
 
----
-
-## Installation
-1. Clone the repository into your ROS workspace:
-   ```bash
-   cd ~/catkin_ws/src
-   git clone <repository_url>
-   ```
-2. Install dependencies:
-   ```bash
-   rosdep install --from-paths src --ignore-src -r -y
-   ```
-3. Build the workspace:
-   ```bash
-   cd ~/catkin_ws
-   catkin_make
-   ```
-4. Source the workspace:
-   ```bash
-   source devel/setup.bash
-   ```
-
----
-
-## Usage
-1. Launch the DOGM node:
-   ```bash
-   roslaunch dogm_ros dogm.launch
-   ```
-2. Visualize the results in RViz:
-   ```bash
-   rosrun rviz rviz -d $(rospack find dogm_ros)/rviz/dogm.rviz
-   ```
-3. Adjust parameters in `config/params.yaml` to fine-tune the algorithm.
-
----
-
 ## Algorithm Details
 
 ### Overview
@@ -130,13 +93,3 @@ The algorithm is highly configurable via `config/params.yaml`. Key parameters in
 - `radar_static_vel_thresh`: Velocity threshold for classifying a radar detection as static.
 - `max_dynamic_birth_ratio`: Maximum ratio of dynamic particles to generate in a new cell.
 - `min_dynamic_birth_ratio`: Minimum ratio of dynamic particles to generate in a new cell.
-
----
-
-## License
-This package is licensed under the [MIT License](LICENSE).
-
----
-
-## Acknowledgments
-This package is inspired by state-of-the-art research in dynamic occupancy grid mapping and sensor fusion.

@@ -12,17 +12,12 @@ public:
     ParticleFilter(int num_particles, double process_noise_pos, double process_noise_vel);
     ~ParticleFilter() = default;
 
+    // [수정] 가속도 보정을 위한 d_ego_vx, d_ego_vy 인자 추가
     void predict(double dt, double survival_prob,
                  double damping_thresh, double damping_factor,
-                 double max_vel);
+                 double max_vel,
+                 double d_ego_vx = 0.0, double d_ego_vy = 0.0);
 
-    /**
-     * @brief Updates particle weights based on BOTH LiDAR and Radar.
-     * @param measurement_grid LiDAR (μ, Σ⁻¹) model
-     * @param grid The full GridCell vector (for radar cos/sin)
-     * @param grid_map The map object (needed for getSmoothedRadarVrHint)
-     * @param radar_noise_stddev Standard deviation of radar velocity noise
-     */
     void updateWeights(const std::vector<MeasurementCell>& measurement_grid,
                        const std::vector<GridCell>& grid,
                        const DynamicGridMap& grid_map,

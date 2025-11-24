@@ -48,6 +48,7 @@ add_executable(dogm_node
   src/dogm_node.cpp
   src/dynamic_grid_map.cpp
   src/particle_filter.cpp
+  src/ego_calibration.cpp
 )
 
 # Link DOGM node against required libraries
