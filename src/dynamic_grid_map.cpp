@@ -330,7 +330,7 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
     }
 
     auto& parts = particle_filter_->getParticles();
-    const int need_on_frames = 2; const int need_off_frames = 2;
+    const int need_on_frames = 2; const int need_off_frames = 4;
 
     auto flush_cell = [&](int cell_idx, int start, int end) {
         if (cell_idx < 0 || cell_idx >= static_cast<int>(grid_.size())) return;
