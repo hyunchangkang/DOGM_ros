@@ -8,9 +8,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Compiler options (e.g., optimization)
 add_compile_options(-O2)
 
-# --- [NEW] Find OpenMP for parallelization ---
+# --- Find OpenMP for parallelization ---
 find_package(OpenMP REQUIRED)
-# --- [END NEW] ---
 
 # Find necessary Catkin packages
 find_package(catkin REQUIRED COMPONENTS
@@ -20,8 +19,8 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
   tf2_ros
   tf2_geometry_msgs
+  tf2_eigen           
   visualization_msgs
-  # Add PCL dependencies
   pcl_ros
   pcl_conversions
 )
@@ -32,13 +31,12 @@ find_package(PCL 1.7 REQUIRED)
 # Declare Catkin package details
 catkin_package(
   INCLUDE_DIRS include        # Export 'include' directory
-  CATKIN_DEPENDS geometry_msgs nav_msgs roscpp sensor_msgs tf2_ros tf2_geometry_msgs visualization_msgs pcl_ros pcl_conversions
+  CATKIN_DEPENDS geometry_msgs nav_msgs roscpp sensor_msgs tf2_ros tf2_geometry_msgs tf2_eigen visualization_msgs pcl_ros pcl_conversions
 )
 
 # Specify include directories
 include_directories(
-  include                     
-# Package's own include directory
+  include         
   ${catkin_INCLUDE_DIRS}    # Include directories from Catkin dependencies
   ${PCL_INCLUDE_DIRS}       # PCL include directories
 )
@@ -55,12 +53,12 @@ add_executable(dogm_node
 target_link_libraries(dogm_node
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
-  OpenMP::OpenMP_CXX # [NEW] Link OpenMP
+  OpenMP::OpenMP_CXX # Link OpenMP
 )
 # --- End DOGM Node ---
 
 
-# --- [NEW] Define Radar Visualization Node Executable ---
+# --- Define Radar Visualization Node Executable ---
 add_executable(radar_velocity_viz_node
   src/radar_velocity_viz.cpp
 )
@@ -69,9 +67,8 @@ add_executable(radar_velocity_viz_node
 target_link_libraries(radar_velocity_viz_node
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
-  OpenMP::OpenMP_CXX # [NEW] Link OpenMP (Optional, but good practice)
+  OpenMP::OpenMP_CXX 
 )
-# --- [END NEW] ---
 
 
 # --- Installation Rules ---
@@ -81,8 +78,7 @@ install(TARGETS dogm_node radar_velocity_viz_node
 )
 
 # Install config, launch, and rviz files
-install(DIRECTORY config 
-launch rviz
+install(DIRECTORY config launch rviz
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 # --- End Installation ---

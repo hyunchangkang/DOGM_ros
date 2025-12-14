@@ -13,8 +13,14 @@
 
 #include "dogm_ros/structures.h"
 #include "dogm_ros/particle_filter.h"
-// [NEW] EgoCalibration 헤더 포함
 #include "dogm_ros/ego_calibration.h"
+
+// [신규] 레이다 데이터 패킷 (Cloud + Sensor Origin)
+struct RadarDataPacket {
+    pcl::PointCloud<mmWaveCloudType>::ConstPtr cloud;
+    double sensor_x;
+    double sensor_y;
+};
 
 class DynamicGridMap {
 public:
@@ -32,15 +38,13 @@ public:
                    double radar_static_vel_thresh);
     ~DynamicGridMap() = default;
 
+    // [수정] 다중 레이다 데이터를 받도록 변경
     void generateMeasurementGrid(const sensor_msgs::LaserScan::ConstPtr& scan,
-                                 const pcl::PointCloud<mmWaveCloudType>::ConstPtr& radar_cloud);
+                                 const std::vector<RadarDataPacket>& radar_packets);
 
     void updateOccupancy(double birth_prob);
-
-    // [NEW] Grid Shift 함수 추가
     void shiftGrid(double dx, double dy);
 
-    // [MODIFIED] EgoCalibration 객체를 인자로 받음
     std::vector<Particle> generateNewParticles(double newborn_vel_stddev,
                                                double min_dynamic_birth_ratio,
                                                double max_dynamic_birth_ratio,
@@ -48,14 +52,11 @@ public:
                                                double dynamic_newborn_vel_stddev,
                                                const EgoCalibration& ego_calib);
 
-    // [MODIFIED] EgoCalibration 객체를 인자로 받음
     void calculateVelocityStatistics(double max_vel_for_scaling,
                                      bool   use_ego_comp,
                                      const EgoCalibration& ego_calib);
 
     void toOccupancyGridMsg(nav_msgs::OccupancyGrid& msg, const std::string& frame_id) const;
-
-    // [MODIFIED] EgoCalibration 객체를 인자로 받음
     void toMarkerArrayMsg(visualization_msgs::MarkerArray& arr,
                           const std::string& frame_id,
                           bool show_velocity_arrows,
@@ -70,7 +71,7 @@ public:
     int gridToIndex(int gx, int gy) const;
     void indexToGrid(int idx, int& gx, int& gy) const;
     bool isInside(int gx, int gy) const;
-    bool getSmoothedRadarVrHint(int center_gx, int center_gy, double& smoothed_vr_hint) const;
+
 
 private:
     double grid_size_;

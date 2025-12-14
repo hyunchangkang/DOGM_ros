@@ -13,8 +13,8 @@ struct mmWaveCloudType
     {
         struct
         {
-            float intensity; // SNR 값 저장용
-            float velocity;  // Raw Radial Velocity (vr)
+            float intensity; 
+            float velocity;  
         };
         float data_c[4];
     };
@@ -34,66 +34,64 @@ struct Particle {
     double vx{0.0}, vy{0.0};
     double weight{0.0};
     int    grid_cell_idx{-1};
-    int    age{0}; // 파티클의 나이 (프레임 단위)
+    int    age{0}; 
 };
 
+// [수정] RadarPoint에 센서 정보를 포함하지 않고 Buffer 별로 관리
 struct RadarPoint
 {
-    double radial_velocity; // Raw vr (+/-)
-    double x;               // Position for direction calculation
-    double y;               // Position for direction calculation
-    int age;                // 포인트가 추가된 후 지난 프레임 수
+    double radial_velocity; 
+    double x;               
+    double y;               
+    int age;                
+};
+
+// [신규] 정제된 레이다 힌트 구조체
+struct RadarHint {
+    double vr;          // 평균 도플러 속도
+    double sensor_x;    // 해당 힌트를 만든 센서의 위치 (Azimuth 계산용)
+    double sensor_y;    
+    bool valid{false};
 };
 
 struct GridCell {
-    // DS-PHD/MIB 질량
     double m_occ{0.0};
     double m_free{0.0};
     double rho_b{0.0};
     double rho_p{0.0};
 
-    // 속도 통계
     double mean_vx{0.0}, mean_vy{0.0};
     double var_vx{0.0},  var_vy{0.0}, covar_vxy{0.0};
 
-    // 동적 판정 & 시각화
     bool   is_dynamic{false};
     double dynamic_score{0.0};
     double mahalanobis_dist{0.0}; 
 
-    // 히스테리시스용 연속 프레임 카운트
     std::uint8_t dyn_streak{0};
     std::uint8_t stat_streak{0};
     
-    // --- Radar 1D Hint ---
-    double radar_vr_hint{0.0};      
-    double radar_theta_hint{0.0};   
+    // [수정] 단일 힌트 변수 삭제 -> 힌트 벡터 사용
+    // double radar_vr_hint{0.0}; (삭제)
+    // double radar_theta_hint{0.0}; (삭제)
     
-    // Pre-computed trigonometric values
-    double radar_cos_theta{1.0};    
-    double radar_sin_theta{0.0};    
-    
-    bool has_reliable_radar{false}; 
-    std::vector<RadarPoint> radar_points_buffer; 
+    // [신규] 여러 센서의 힌트를 저장하는 벡터
+    std::vector<RadarHint> radar_hints;
 
-    // For False Static Detection
+    // [수정] 센서별 버퍼 분리 (최대 2개 가정)
+    // buffer_1: Radar 1 (Right), buffer_2: Radar 2 (Left)
+    std::vector<RadarPoint> radar_buffer_1; 
+    std::vector<RadarPoint> radar_buffer_2; 
+
     std::uint8_t free_streak{0}; 
 };
 
 struct MeasurementCell {
-    // [MODIFIED] ISM용 점유 확률 변수 추가
     double m_occ_z{0.0};  
-    
-    double m_free_z{0.0}; // 측정 free 질량
+    double m_free_z{0.0}; 
 
-    // --- LiDAR Likelihood Model Parameters ---
-    bool   has_lidar_model{false}; // True if this cell has a valid model
-    
-    // Mean (μ)
+    bool   has_lidar_model{false}; 
     double mean_x{0.0};
     double mean_y{0.0};
-
-    // Pre-calculated Inverse Covariance Matrix (Σ⁻¹)
     double inv_cov_xx{0.0};
     double inv_cov_xy{0.0};
     double inv_cov_yy{0.0};

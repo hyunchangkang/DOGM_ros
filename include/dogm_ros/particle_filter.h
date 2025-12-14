@@ -12,7 +12,6 @@ public:
     ParticleFilter(int num_particles, double process_noise_pos, double process_noise_vel);
     ~ParticleFilter() = default;
 
-    // [수정] 가속도 보정을 위한 d_ego_vx, d_ego_vy 인자 추가
     void predict(double dt, double survival_prob,
                  double damping_thresh, double damping_factor,
                  double max_vel,
