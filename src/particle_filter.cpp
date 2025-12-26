@@ -5,6 +5,9 @@
 #include <cmath>
 #include <omp.h>
 
+// [Robustness] Minimum probability to prevent particle death
+static const double MIN_RADAR_PROB = 0.1;
+
 ParticleFilter::ParticleFilter(int num_particles, double process_noise_pos, double process_noise_vel)
     : num_particles_(num_particles),
       process_noise_pos_(process_noise_pos),
@@ -27,7 +30,11 @@ void ParticleFilter::predict(double dt, double survival_prob,
     #pragma omp parallel for
     for (int i = 0; i < particles_.size(); ++i) {
         auto& p = particles_[i];
-        p.vx -= d_ego_vx; p.vy -= d_ego_vy;
+        
+        // Ego-motion compensation
+        p.vx -= d_ego_vx; 
+        p.vy -= d_ego_vy;
+
         double pos_noise_x, pos_noise_y, vel_noise_x, vel_noise_y;
         #pragma omp critical (random_gen) 
         {
@@ -36,26 +43,33 @@ void ParticleFilter::predict(double dt, double survival_prob,
             vel_noise_x = vel_noise_dist_(random_generator_);
             vel_noise_y = vel_noise_dist_(random_generator_);
         }
+        
+        // Motion model update
         p.x += p.vx * dt + pos_noise_x;
         p.y += p.vy * dt + pos_noise_y;
-        p.vx += vel_noise_x; p.vy += vel_noise_y;
+        p.vx += vel_noise_x; 
+        p.vy += vel_noise_y;
+
+        // Velocity clamping
         double speed = std::sqrt(p.vx * p.vx + p.vy * p.vy);
         if (speed > max_vel) {
             p.vx = (p.vx / speed) * max_vel;
             p.vy = (p.vy / speed) * max_vel;
         }
+
+        // Damping for stationary particles
         if (p.age > GRACE_PERIOD) {
             if (speed < damping_thresh) {
                 p.vx *= damping_factor;
                 p.vy *= damping_factor;
             }
         }
+
         p.weight *= survival_prob;
         p.age++;
     }
 }
 
-// [수정] Radar Hints Loop & Intersection
 void ParticleFilter::updateWeights(const std::vector<MeasurementCell>& measurement_grid,
                                    const std::vector<GridCell>& grid,
                                    const DynamicGridMap& grid_map,
@@ -63,8 +77,10 @@ void ParticleFilter::updateWeights(const std::vector<MeasurementCell>& measureme
 {
     double total_weight = 0.0;
     const double radar_variance = radar_noise_stddev * radar_noise_stddev;
-    // Normalization factor not strictly needed as weights are normalized later, but kept for scale
+    // Normalization factor for Gaussian probability
     const double radar_norm_factor = -0.5 / std::max(1e-9, radar_variance);
+
+    const int search_radius = grid_map.getRadarHintSearchRadius();
 
     #pragma omp parallel for reduction(+:total_weight)
     for (int i = 0; i < particles_.size(); ++i)
@@ -73,57 +89,88 @@ void ParticleFilter::updateWeights(const std::vector<MeasurementCell>& measureme
         
         if (p.weight > 1e-9)
         {
-            if (p.grid_cell_idx >= 0 && p.grid_cell_idx < measurement_grid.size())
+            if (p.grid_cell_idx >= 0 && p.grid_cell_idx < static_cast<int>(measurement_grid.size()))
             {
                 const auto& meas_cell = measurement_grid[p.grid_cell_idx];
+                
+                // 1. LiDAR Likelihood
                 double lidar_likelihood = 1e-9;
                 if (meas_cell.has_lidar_model) {
                     double dx = p.x - meas_cell.mean_x;
                     double dy = p.y - meas_cell.mean_y;
+                    
                     double zx = dx * meas_cell.inv_cov_xx + dy * meas_cell.inv_cov_xy;
                     double zy = dx * meas_cell.inv_cov_xy + dy * meas_cell.inv_cov_yy;
                     double mahal_dist_sq = zx * dx + zy * dy;
+                    
                     lidar_likelihood = std::exp(-0.5 * mahal_dist_sq);
+                    // Squaring emphasizes the peak, making the filter more aggressive
+                    // lidar_likelihood = lidar_likelihood * lidar_likelihood;
                 }
 
-                // [핵심] Dual Radar Likelihood Intersection
-                double radar_likelihood = 1.0;
-                const auto& grid_cell = grid[p.grid_cell_idx];
+                // 2. Radar Likelihood
+                // Initialized to 1.0 (identity for multiplication).
+                // If no valid radar hints are found, it remains 1.0 (neutral).
+                double radar_likelihood = 1.0; 
+                
+                int p_gx, p_gy;
+                grid_map.indexToGrid(p.grid_cell_idx, p_gx, p_gy);
 
-                if (!grid_cell.radar_hints.empty()) {
-                    for (const auto& hint : grid_cell.radar_hints) {
-                        // 1. Particle -> Sensor Azimuth
-                        double dx = p.x - hint.sensor_x;
-                        double dy = p.y - hint.sensor_y;
-                        double azimuth = std::atan2(dy, dx);
+                for (int dy = -search_radius; dy <= search_radius; ++dy) {
+                    for (int dx = -search_radius; dx <= search_radius; ++dx) {
+                        int nx = p_gx + dx;
+                        int ny = p_gy + dy;
                         
-                        // 2. Project Particle Velocity
-                        double vr_expected = p.vx * std::cos(azimuth) + p.vy * std::sin(azimuth);
+                        if (!grid_map.isInside(nx, ny)) continue;
                         
-                        // 3. Error & Likelihood
-                        double error = vr_expected - hint.vr;
-                        double prob = std::exp(error * error * radar_norm_factor); // exp(-error^2 / 2var)
+                        const auto& neighbor_cell = grid[grid_map.gridToIndex(nx, ny)];
                         
-                        // 4. Multiply (Intersection)
-                        radar_likelihood *= prob;
+                        if (!neighbor_cell.radar_hints.empty()) {
+                            for (const auto& hint : neighbor_cell.radar_hints) {
+                                // [Filtering] Ignore low radial velocity measurements.
+                                // If abs(vr) < 0.1, it's likely lateral motion (Doppler ~ 0) or static clutter.
+                                // We skip these to prevent them from killing dynamic particles.
+                                if (std::abs(hint.vr) < 0.1) continue;
+
+                                // B. Expected Radial Velocity Calculation
+                                // Uses pre-computed trigonometric values (obs_cos_theta, obs_sin_theta)
+                                // to avoid expensive 'atan2', 'cos', 'sin' calls inside the loop.
+                                // Formula: vr_exp = vx * cos(theta) + vy * sin(theta)
+                                double vr_expected = p.vx * hint.obs_cos_theta + p.vy * hint.obs_sin_theta;
+                                
+                                // C. Probability Calculation
+                                double error = vr_expected - hint.vr;
+                                double prob = std::exp(error * error * radar_norm_factor);
+                                
+                                // D. Update Likelihood (Product Rule)
+                                // Use MIN_RADAR_PROB to prevent likelihood from becoming zero.
+                                radar_likelihood *= std::max(prob, MIN_RADAR_PROB);
+                            }
+                        }
                     }
                 }
 
+                // 3. Final Weight Update
+                // Combine LiDAR and Radar likelihoods.
                 p.weight *= (lidar_likelihood * radar_likelihood);
             }
-            else { p.weight *= 0.01; }
+            else { 
+                // Penalty for particles outside the valid grid area
+                p.weight *= 0.01; 
+            }
         }
         total_weight += p.weight;
     }
 
+    // Normalization
     if (total_weight > 1e-9) {
         for (auto& p : particles_) p.weight /= total_weight;
     }
 }
 
+
 void ParticleFilter::sortParticlesByGridCell(const DynamicGridMap& grid_map)
 {
-    // (이전과 동일)
     #pragma omp parallel for
     for (int i = 0; i < particles_.size(); ++i) {
         auto& p = particles_[i];
@@ -142,7 +189,6 @@ void ParticleFilter::sortParticlesByGridCell(const DynamicGridMap& grid_map)
 
 void ParticleFilter::resample(const std::vector<Particle>& new_born_particles)
 {
-    // (이전과 동일)
     std::vector<Particle> combined_pool;
     combined_pool.reserve(particles_.size() + new_born_particles.size());
     combined_pool.insert(combined_pool.end(), particles_.begin(), particles_.end());
@@ -171,14 +217,52 @@ void ParticleFilter::resample(const std::vector<Particle>& new_born_particles)
         double u = r + m * (1.0 / num_particles_);
         while (u > c) {
             i++;
-            if (i >= combined_pool.size()) i = combined_pool.size() - 1;
+            if (i >= static_cast<int>(combined_pool.size())) i = combined_pool.size() - 1;
             c += combined_pool[i].weight;
         }
         new_particle_set.push_back(combined_pool[i]);
     }
     particles_ = new_particle_set;
+    
     if (!particles_.empty()) {
         double uniform_weight = 1.0 / particles_.size();
         for (auto& p : particles_) p.weight = uniform_weight;
     }
+}
+
+// ----------------------------------------------------------------
+// [Implementation] Sector Gating Logic (Separated Mag & Angle)
+// ----------------------------------------------------------------
+bool ParticleFilter::checkSectorMatch(const Particle& winner, const Particle& candidate, 
+                                      double vel_thresh, double ang_thresh_deg)
+{
+    // 1. Calculate Magnitudes (Speed)
+    double winner_mag = std::sqrt(winner.vx * winner.vx + winner.vy * winner.vy);
+    double cand_mag = std::sqrt(candidate.vx * candidate.vx + candidate.vy * candidate.vy);
+    
+    // 2. Calculate Angles (Direction) [Rad]
+    double winner_ang = std::atan2(winner.vy, winner.vx);
+    double cand_ang = std::atan2(candidate.vy, candidate.vx);
+
+    // 3. Compute Differences
+    double mag_diff = std::abs(winner_mag - cand_mag);
+    double ang_diff_rad = angleDiff(winner_ang, cand_ang);
+    double ang_diff_deg = std::abs(ang_diff_rad * 180.0 / M_PI);
+
+    // 4. Check Thresholds (Sector Gating: AND condition)
+    if (mag_diff <= vel_thresh && ang_diff_deg <= ang_thresh_deg) {
+        return true;
+    }
+    return false;
+}
+
+double ParticleFilter::normalizeAngle(double angle) {
+    while (angle > M_PI) angle -= 2.0 * M_PI;
+    while (angle < -M_PI) angle += 2.0 * M_PI;
+    return angle;
+}
+
+double ParticleFilter::angleDiff(double a1, double a2) {
+    double diff = a1 - a2;
+    return normalizeAngle(diff);
 }

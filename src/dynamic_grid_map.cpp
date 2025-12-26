@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <vector>
 #include <random>
+#include <queue> 
+#include <map>
 
 DynamicGridMap::DynamicGridMap(double grid_size, double resolution, int num_particles,
                                double process_noise_pos, double process_noise_vel,
@@ -14,9 +16,12 @@ DynamicGridMap::DynamicGridMap(double grid_size, double resolution, int num_part
                                bool use_radar,
                                int lidar_hit_point,
                                double lidar_noise_stddev,
-                               double mode_cluster_velocity_thresh,
+                               // [Params]
+                               double particle_vector_vel_thresh,
+                               double particle_vector_ang_thresh,
                                double particle_static_vel_thresh,
-                               double radar_static_vel_thresh)
+                               double radar_static_vel_thresh,
+                               bool cluster_mode)
     : grid_size_(grid_size),
       resolution_(resolution),
       radar_buffer_size_(radar_buffer_size),
@@ -29,9 +34,12 @@ DynamicGridMap::DynamicGridMap(double grid_size, double resolution, int num_part
       use_radar_(use_radar),
       lidar_hit_point_(lidar_hit_point),
       lidar_noise_stddev_(lidar_noise_stddev),
-      mode_cluster_velocity_thresh_sq_(mode_cluster_velocity_thresh * mode_cluster_velocity_thresh),
+      // [Thresholds]
+      particle_vector_vel_thresh_(particle_vector_vel_thresh),
+      particle_vector_ang_thresh_(particle_vector_ang_thresh),
       particle_static_vel_thresh_(particle_static_vel_thresh),
       radar_static_vel_thresh_(radar_static_vel_thresh),
+      cluster_mode_(cluster_mode),
       random_generator_(std::mt19937(std::random_device()()))
 {
     grid_width_  = static_cast<int>(std::round(grid_size_ / resolution_));
@@ -45,6 +53,7 @@ DynamicGridMap::DynamicGridMap(double grid_size, double resolution, int num_part
     );
 }
 
+// ... (Helper functions - 기존과 동일) ...
 bool DynamicGridMap::isInside(int gx, int gy) const { return (gx >= 0 && gx < grid_width_ && gy >= 0 && gy < grid_height_); }
 int DynamicGridMap::gridToIndex(int gx, int gy) const { return gy * grid_width_ + gx; }
 void DynamicGridMap::indexToGrid(int idx, int& gx, int& gy) const { gy = idx / grid_width_; gx = idx % grid_width_; }
@@ -58,42 +67,31 @@ void DynamicGridMap::gridToWorld(int gx, int gy, double& wx, double& wy) const {
     wy = origin_y_ + (static_cast<double>(gy) + 0.5) * resolution_;
 }
 
-// [수정] Radar Processing Logic with Dual Sensors
 void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::ConstPtr& scan, 
                                              const std::vector<RadarDataPacket>& radar_packets) {
-    // 1. 초기화
     for (auto& m : measurement_grid_) { m.m_free_z = 0.0; m.m_occ_z = 0.0; m.has_lidar_model = false; }
     for (auto& c : grid_) { c.radar_hints.clear(); }
 
-    // 2. Radar Buffer Aging
     for (auto& c : grid_) {
-        // Buffer 1 (Radar 1)
         for (auto& rp : c.radar_buffer_1) { rp.age++; }
         c.radar_buffer_1.erase(std::remove_if(c.radar_buffer_1.begin(), c.radar_buffer_1.end(),
                            [this](const RadarPoint& rp) { return rp.age > this->radar_buffer_size_; }), c.radar_buffer_1.end());
-        // Buffer 2 (Radar 2)
         for (auto& rp : c.radar_buffer_2) { rp.age++; }
         c.radar_buffer_2.erase(std::remove_if(c.radar_buffer_2.begin(), c.radar_buffer_2.end(),
                            [this](const RadarPoint& rp) { return rp.age > this->radar_buffer_size_; }), c.radar_buffer_2.end());
     }
 
-    // 3. New Radar Points Binning
     if (use_radar_) {
         for (size_t i = 0; i < radar_packets.size(); ++i) {
             const auto& packet = radar_packets[i];
             if (!packet.cloud) continue;
-
             for (const auto& pt : packet.cloud->points) {
                 int gx, gy;
                 if (worldToGrid(pt.x, pt.y, gx, gy)) {
                     int idx = gridToIndex(gx, gy);
                     RadarPoint new_rp; 
                     new_rp.radial_velocity = pt.velocity; 
-                    new_rp.x = pt.x; 
-                    new_rp.y = pt.y; 
-                    new_rp.age = 0;
-                    
-                    // i=0 -> Buffer 1, i=1 -> Buffer 2
+                    new_rp.x = pt.x; new_rp.y = pt.y; new_rp.age = 0;
                     if (i == 0) grid_[idx].radar_buffer_1.push_back(new_rp);
                     else if (i == 1) grid_[idx].radar_buffer_2.push_back(new_rp);
                 }
@@ -101,56 +99,58 @@ void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::Const
         }
     }
 
-    // 4. Hint Extraction (Simple Average per Sensor)
-    // Helper Lambda for extraction
-    auto processBuffer = [&](const std::vector<RadarPoint>& buffer, double sx, double sy, int min_pts) -> RadarHint {
+    auto processBuffer = [&](const std::vector<RadarPoint>& buffer, double sx, double sy, int min_pts) -> RadarHint 
+    {
         RadarHint hint;
         if (buffer.size() < static_cast<size_t>(min_pts)) return hint;
 
         double sum_vr = 0.0, sum_x = 0.0, sum_y = 0.0;
-        for (const auto& rp : buffer) {
-            sum_vr += rp.radial_velocity;
-            sum_x += rp.x;
-            sum_y += rp.y;
+        for (const auto& rp : buffer) { 
+            sum_vr += rp.radial_velocity; 
+            sum_x += rp.x; 
+            sum_y += rp.y; 
         }
-        
-        hint.vr = sum_vr / buffer.size(); // Simple Average
-        double mean_x = sum_x / buffer.size();
-        double mean_y = sum_y / buffer.size();
 
-        // Calculate Sensor-Relative Azimuth
-        hint.sensor_x = sx;
-        hint.sensor_y = sy;
-        // 각도 계산을 여기서 하지 않고 사용할 때 해도 되지만, 구조체 정의상 사용하는 곳에서 함.
-        // 여기서는 센서 위치만 잘 저장.
+        // 1. 관측 데이터들의 평균(무게중심) 계산
+        hint.vr = sum_vr / buffer.size(); 
+        double mean_x = sum_x / buffer.size(); 
+        double mean_y = sum_y / buffer.size();
+        
+        hint.sensor_x = sx; 
+        hint.sensor_y = sy; 
         hint.valid = true;
+
+        // 2. [핵심 수정] 관측 무게중심을 기준으로 '각도'를 확정 (파티클 위치 무관)
+        double dx = mean_x - sx;
+        double dy = mean_y - sy;
+        double angle = std::atan2(dy, dx); // 센서 -> 관측점 절대 각도
+
+        // 3. 파티클 필터용 삼각함수 값 미리 계산 (최적화 & 안정화)
+        hint.obs_cos_theta = std::cos(angle);
+        hint.obs_sin_theta = std::sin(angle);
+
         return hint;
     };
 
     for (int idx = 0; idx < grid_.size(); ++idx) {
         auto& c = grid_[idx];
-        
-        // Sensor 1 Hint
         if (radar_packets.size() > 0) {
             RadarHint h1 = processBuffer(c.radar_buffer_1, radar_packets[0].sensor_x, radar_packets[0].sensor_y, min_radar_points_);
             if (h1.valid) c.radar_hints.push_back(h1);
         }
-        
-        // Sensor 2 Hint
         if (radar_packets.size() > 1) {
             RadarHint h2 = processBuffer(c.radar_buffer_2, radar_packets[1].sensor_x, radar_packets[1].sensor_y, min_radar_points_);
             if (h2.valid) c.radar_hints.push_back(h2);
         }
     }
-
-    // 5. LiDAR Processing (동일)
+    
+    // Lidar Processing (Simplified for brevity as it's unchanged)
     std::vector<std::vector<std::pair<double, double>>> cell_hits(grid_width_ * grid_height_);
     if (!scan) return;
     const double angle_min = static_cast<double>(scan->angle_min);
     const double angle_inc = static_cast<double>(scan->angle_increment);
     const double range_max = static_cast<double>(scan->range_max);
     
-    // LiDAR Ray-casting (Free Space)
     for (size_t i = 0; i < scan->ranges.size(); ++i) {
         double r  = static_cast<double>(scan->ranges[i]);
         if (!std::isfinite(r) || r<0.01) { r = range_max; }
@@ -160,32 +160,24 @@ void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::Const
         const double P_FREE = 0.4; 
 
         for (double rr = 0.0; rr < limit; rr += step) {
-            const double wx = rr * std::cos(th);
-            const double wy = rr * std::sin(th);
+            const double wx = rr * std::cos(th); const double wy = rr * std::sin(th);
             int gx, gy;
             if (!worldToGrid(wx, wy, gx, gy)) break;
             measurement_grid_[gridToIndex(gx, gy)].m_free_z = P_FREE;
         }
         if (r < range_max) {
-            const double wx = r * std::cos(th);
-            const double wy = r * std::sin(th);
+            const double wx = r * std::cos(th); const double wy = r * std::sin(th);
             int gx, gy;
             if (worldToGrid(wx, wy, gx, gy)) cell_hits[gridToIndex(gx, gy)].push_back({wx, wy});
         }
     }
-
-    const double lidar_variance_reg = lidar_noise_stddev_ * lidar_noise_stddev_;
     
-    // Occupancy & Gaussian Model
+    const double lidar_variance_reg = lidar_noise_stddev_ * lidar_noise_stddev_;
     for (int idx = 0; idx < static_cast<int>(grid_.size()); ++idx) {
         auto& meas_cell = measurement_grid_[idx];
         const auto& hits = cell_hits[idx];
-        
         if (hits.size() < static_cast<size_t>(lidar_hit_point_)) continue; 
-        
-        meas_cell.m_occ_z = 0.7; 
-        meas_cell.m_free_z = 0.0; 
-
+        meas_cell.m_occ_z = 0.7; meas_cell.m_free_z = 0.0; 
         double sum_x = 0.0, sum_y = 0.0;
         for (const auto& p : hits) { sum_x += p.first; sum_y += p.second; }
         meas_cell.mean_x = sum_x / hits.size(); meas_cell.mean_y = sum_y / hits.size();
@@ -201,12 +193,13 @@ void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::Const
         double det = cov_xx * cov_yy - cov_xy * cov_xy;
         if (std::abs(det) < 1e-9) continue;
         double inv_det = 1.0 / det;
-        meas_cell.inv_cov_xx =  cov_yy * inv_det; meas_cell.inv_cov_xy = -cov_xy * inv_det; meas_cell.inv_cov_yy =  cov_xx * inv_det;
+        meas_cell.inv_cov_xx = cov_yy * inv_det; meas_cell.inv_cov_xy = -cov_xy * inv_det; meas_cell.inv_cov_yy = cov_xx * inv_det;
         meas_cell.has_lidar_model = true;
     }
 }
 
 void DynamicGridMap::updateOccupancy(double birth_prob) {
+    // ... (Occupancy Update logic unchanged) ...
     for (auto& c : grid_) {
         c.m_occ  = std::max(0.0, c.m_occ  * 0.55);
         c.m_free = std::max(0.0, c.m_free * 0.55);
@@ -216,21 +209,16 @@ void DynamicGridMap::updateOccupancy(double birth_prob) {
     for (int idx = 0; idx < static_cast<int>(grid_.size()); ++idx) {
         auto& cell = grid_[idx];
         const auto& meas = measurement_grid_[idx];
-        
         double m_occ_z_proxy = meas.m_occ_z; 
         double m_occ_pred = std::min(1.0, std::max(0.0, cell.m_occ));
         double m_free_pred= std::min(1.0, std::max(0.0, cell.m_free));
         double m_unk_pred = std::max(0.0, 1.0 - m_occ_pred - m_free_pred);
-        
         double K = m_occ_pred * meas.m_free_z + m_free_pred * m_occ_z_proxy;
         double norm = 1.0 / std::max(1e-9, (1.0 - K));
-        
         double m_occ_upd = norm * (m_occ_pred * (1.0 - meas.m_free_z) + m_unk_pred * m_occ_z_proxy);
         double m_free_upd= norm * (m_free_pred * (1.0 - m_occ_z_proxy) + m_unk_pred * meas.m_free_z);
-        
         m_occ_upd = std::min(1.0, std::max(0.0, m_occ_upd));
         m_free_upd= std::min(1.0, std::max(0.0, m_free_upd));
-        
         double term = m_occ_pred + birth_prob * m_unk_pred;
         cell.rho_b = (term > 1e-9) ? (m_occ_upd * birth_prob * m_unk_pred) / term : 0.0;
         cell.rho_p = std::max(0.0, m_occ_upd - cell.rho_b);
@@ -238,12 +226,11 @@ void DynamicGridMap::updateOccupancy(double birth_prob) {
     }
 }
 
-// [수정] Max Compensated Velocity 계산 및 동적 판단
 void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
                                                  bool   use_ego_comp,
                                                  const EgoCalibration& ego_calib)
 {
-    // 1. 초기화
+    // 1. Initialization
     for (auto& cell : grid_) {
         cell.is_dynamic = false; 
         cell.dyn_streak = 0; cell.stat_streak = 0;
@@ -266,20 +253,30 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
             c.dyn_streak = 0; return;
         }
 
-        double max_weight = -1.0; int winner_idx = start;
+        // --- [Cell-Level Winner Mode] ---
+        // 1. Find Winner in Cell
+        double max_weight = -1.0;
+        int winner_idx = start;
         for (int j = start; j < end; ++j) {
-            if (parts[j].weight > max_weight) { max_weight = parts[j].weight; winner_idx = j; }
+            if (parts[j].weight > max_weight) {
+                max_weight = parts[j].weight;
+                winner_idx = j;
+            }
         }
-        const double winner_vx = parts[winner_idx].vx; const double winner_vy = parts[winner_idx].vy;
-        double mode_w_sum = 0.0, mode_vx_sum = 0.0, mode_vy_sum = 0.0;
-        const double VELOCITY_THRESHOLD_SQ = mode_cluster_velocity_thresh_sq_; 
+        
+        // 2. Sector Gating (Vel 0.1, Ang 60.0)
+        double mode_vx_sum = 0.0;
+        double mode_vy_sum = 0.0;
+        double mode_w_sum = 0.0;
 
         for (int j = start; j < end; ++j) {
-            const double dvx = parts[j].vx - winner_vx; const double dvy = parts[j].vy - winner_vy;
-            if ((dvx * dvx + dvy * dvy) < VELOCITY_THRESHOLD_SQ) {
-                mode_w_sum += parts[j].weight;
-                mode_vx_sum += parts[j].weight * parts[j].vx;
-                mode_vy_sum += parts[j].weight * parts[j].vy;
+            if (particle_filter_->checkSectorMatch(parts[winner_idx], parts[j], 
+                                                   particle_vector_vel_thresh_, 
+                                                   particle_vector_ang_thresh_)) 
+            {
+                mode_vx_sum += parts[j].vx * parts[j].weight;
+                mode_vy_sum += parts[j].vy * parts[j].weight;
+                mode_w_sum  += parts[j].weight;
             }
         }
 
@@ -291,6 +288,7 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
 
         c.mean_vx = mode_vx_sum / mode_w_sum;
         c.mean_vy = mode_vy_sum / mode_w_sum;
+        // --- [End Cell-Level] ---
 
         double speed_p = std::sqrt(c.mean_vx * c.mean_vx + c.mean_vy * c.mean_vy);
         if (use_ego_comp) { 
@@ -301,7 +299,6 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
         const bool is_occupied = (c.m_occ >= c.m_free && c.m_occ >= m_unk);
         const bool has_speed_from_particles = (speed_p > particle_static_vel_thresh_);
 
-        // [핵심] Max Compensated Velocity Search
         double max_comp_speed = 0.0;
         int gx, gy; indexToGrid(cell_idx, gx, gy);
 
@@ -311,16 +308,12 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
                     int nx = gx + dx; int ny = gy + dy;
                     if (isInside(nx, ny)) {
                         const auto& neighbor = grid_[gridToIndex(nx, ny)];
-                        
                         double cell_wx, cell_wy;
                         gridToWorld(nx, ny, cell_wx, cell_wy);
 
                         for (const auto& hint : neighbor.radar_hints) {
-                            // 1. 센서 기준 Azimuth
                             double azimuth = std::atan2(cell_wy - hint.sensor_y, cell_wx - hint.sensor_x);
-                            // 2. Ego Compensated Absolute Radial Velocity
                             double abs_vr = std::abs(ego_calib.getAbsoluteRadialVelocity(hint.vr, azimuth));
-                            // 3. Max Update
                             if (abs_vr > max_comp_speed) {
                                 max_comp_speed = abs_vr;
                             }
@@ -330,17 +323,10 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
             }
         }
         
-        // 동적 판단 조건 업데이트
         const bool has_speed_from_radar = (max_comp_speed > radar_static_vel_thresh_);
-        const bool is_reliably_static_by_radar = (max_comp_speed < particle_static_vel_thresh_ && max_comp_speed > 0.0); // 0.0인 경우는 레이다가 없는 것
-
         bool dyn_candidate = false;
         if (use_radar_) {
-            // 입자가 빠르거나, 레이다가 확실히 빠르면 동적
             dyn_candidate = is_occupied && (has_speed_from_particles || has_speed_from_radar);
-            // 정적 조건 강화: 입자가 빠른데 레이다가 정지해있다고 강력히 주장하면 정적? 
-            // 아니, Max 로직이므로 레이다가 빠르다고 하면 무조건 동적.
-            
             bool is_currently_static = is_occupied && !dyn_candidate;
             if (use_fsd_ && is_currently_static && c.stat_streak >= fsd_T_static_ && c.free_streak >= fsd_T_free_) { 
                 dyn_candidate = true; c.free_streak = 0; 
@@ -377,9 +363,196 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
             first_i = i;
         }
     }
+
+    // [New] Execute Cluster-based Processing if enabled
+    if (cluster_mode_) {
+        processDynamicClusters(ego_calib);
+    }
 }
 
-// [수정] Max Compensated Velocity 사용 Birth Ratio
+
+// void DynamicGridMap::processDynamicClusters(const EgoCalibration& ego_calib) {
+//     auto& parts = particle_filter_->getParticles();
+    
+//     // 1. Pre-compute particle ranges for each cell (Efficiency O(N))
+//     // parts is sorted by grid_cell_idx. We build a map: cell_idx -> {start_idx, end_idx}
+//     std::vector<std::pair<int, int>> cell_particle_ranges(grid_.size(), {-1, -1});
+    
+//     int current_cell = -1;
+//     int start_p = 0;
+//     for (int i = 0; i <= static_cast<int>(parts.size()); ++i) {
+//         bool last = (i == static_cast<int>(parts.size()));
+//         int c_idx = last ? -1 : parts[i].grid_cell_idx;
+        
+//         if (last || c_idx != current_cell) {
+//             if (current_cell >= 0 && current_cell < static_cast<int>(grid_.size())) {
+//                 cell_particle_ranges[current_cell] = {start_p, i};
+//             }
+//             current_cell = c_idx;
+//             start_p = i;
+//         }
+//     }
+
+//     // 2. BFS Clustering
+//     std::vector<bool> visited(grid_.size(), false);
+    
+//     for (int i = 0; i < grid_.size(); ++i) {
+//         // Only process dynamic cells that haven't been visited
+//         if (visited[i] || !grid_[i].is_dynamic) continue;
+        
+//         // Start new cluster
+//         std::vector<int> cluster_indices;
+//         std::queue<int> q;
+        
+//         q.push(i);
+//         visited[i] = true;
+        
+//         while (!q.empty()) {
+//             int curr = q.front(); q.pop();
+//             cluster_indices.push_back(curr);
+            
+//             int gx, gy; indexToGrid(curr, gx, gy);
+            
+//             // 8-Connectivity Search
+//             for (int dy = -1; dy <= 1; ++dy) {
+//                 for (int dx = -1; dx <= 1; ++dx) {
+//                     if (dx == 0 && dy == 0) continue;
+//                     int nx = gx + dx; int ny = gy + dy;
+                    
+//                     if (isInside(nx, ny)) {
+//                         int nidx = gridToIndex(nx, ny);
+//                         if (!visited[nidx] && grid_[nidx].is_dynamic) {
+//                             visited[nidx] = true;
+//                             q.push(nidx);
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+        
+//         // 3. Process the Cluster
+//         if (cluster_indices.empty()) continue;
+
+//         // A. Find "Global Winner" in the entire cluster
+//         double global_max_weight = -1.0;
+//         int global_winner_p_idx = -1;
+
+//         // Iterate all cells in cluster to find winner particle
+//         for (int c_idx : cluster_indices) {
+//             std::pair<int, int> range = cell_particle_ranges[c_idx];
+//             if (range.first == -1) continue; // No particles in this cell
+
+//             for (int p_idx = range.first; p_idx < range.second; ++p_idx) {
+//                 if (parts[p_idx].weight > global_max_weight) {
+//                     global_max_weight = parts[p_idx].weight;
+//                     global_winner_p_idx = p_idx;
+//                 }
+//             }
+//         }
+
+//         if (global_winner_p_idx == -1) continue; // Should not happen if dynamic
+
+//         const Particle& global_winner = parts[global_winner_p_idx];
+
+//         // B. Calculate Cluster Mean Velocity using Sector Gating
+//         double cluster_vx_sum = 0.0;
+//         double cluster_vy_sum = 0.0;
+//         double cluster_w_sum = 0.0;
+
+//         for (int c_idx : cluster_indices) {
+//             std::pair<int, int> range = cell_particle_ranges[c_idx];
+//             if (range.first == -1) continue;
+
+//             for (int p_idx = range.first; p_idx < range.second; ++p_idx) {
+//                 // Check Sector Match (0.1 m/s, 60.0 deg) against Global Winner
+//                 if (particle_filter_->checkSectorMatch(global_winner, parts[p_idx], 
+//                                                        particle_vector_vel_thresh_, 
+//                                                        particle_vector_ang_thresh_)) 
+//                 {
+//                     cluster_vx_sum += parts[p_idx].vx * parts[p_idx].weight;
+//                     cluster_vy_sum += parts[p_idx].vy * parts[p_idx].weight;
+//                     cluster_w_sum  += parts[p_idx].weight;
+//                 }
+//             }
+//         }
+
+//         // C. Update Constituent Cells
+//         if (cluster_w_sum > 1e-9) {
+//             double cluster_mean_vx = cluster_vx_sum / cluster_w_sum;
+//             double cluster_mean_vy = cluster_vy_sum / cluster_w_sum;
+
+//             // Apply unified velocity to all cells in the cluster
+//             for (int c_idx : cluster_indices) {
+//                 grid_[c_idx].mean_vx = cluster_mean_vx;
+//                 grid_[c_idx].mean_vy = cluster_mean_vy;
+//             }
+//         }
+//     }
+// }
+
+void DynamicGridMap::processDynamicClusters(const EgoCalibration& ego_calib) {
+    // 1. BFS Clustering (기존과 동일: 8-이웃 연결성으로 동적 셀 그룹화)
+    std::vector<bool> visited(grid_.size(), false);
+    
+    for (int i = 0; i < grid_.size(); ++i) {
+        // 이미 방문했거나 동적 셀이 아니면 건너뜀
+        if (visited[i] || !grid_[i].is_dynamic) continue;
+        
+        std::vector<int> cluster_indices;
+        std::queue<int> q;
+        q.push(i);
+        visited[i] = true;
+        
+        // BFS 탐색 시작
+        while (!q.empty()) {
+            int curr = q.front(); q.pop();
+            cluster_indices.push_back(curr);
+            int gx, gy; indexToGrid(curr, gx, gy);
+            
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    int nx = gx + dx; int ny = gy + dy;
+                    if (isInside(nx, ny)) {
+                        int nidx = gridToIndex(nx, ny);
+                        if (!visited[nidx] && grid_[nidx].is_dynamic) {
+                            visited[nidx] = true;
+                            q.push(nidx);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 2. [수정됨] 클러스터 처리: 단순 평균 계산 (Simple Average of Cell Velocities)
+        if (cluster_indices.empty()) continue;
+
+        double cluster_vx_sum = 0.0;
+        double cluster_vy_sum = 0.0;
+        int count = 0;
+
+        // 클러스터 내에 속한 각 셀의 속도(이미 개별적으로 계산된 값)를 모두 더함
+        for (int c_idx : cluster_indices) {
+             cluster_vx_sum += grid_[c_idx].mean_vx;
+             cluster_vy_sum += grid_[c_idx].mean_vy;
+             count++;
+        }
+
+        // 3. 평균 속도 적용
+        if (count > 0) {
+            double cluster_mean_vx = cluster_vx_sum / static_cast<double>(count);
+            double cluster_mean_vy = cluster_vy_sum / static_cast<double>(count);
+
+            // 계산된 평균 속도를 클러스터 내 모든 셀에 일괄 덮어쓰기
+            for (int c_idx : cluster_indices) {
+                grid_[c_idx].mean_vx = cluster_mean_vx;
+                grid_[c_idx].mean_vy = cluster_mean_vy;
+            }
+        }
+    }
+}
+
+
 std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_stddev,
                                                double min_dynamic_birth_ratio,
                                                double max_dynamic_birth_ratio,
@@ -388,22 +561,32 @@ std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_st
                                                const EgoCalibration& ego_calib)
 {
     std::vector<Particle> new_particles;
+    
+    // 1. Ego Motion 보정용 정적 속도 가져오기
     double static_vx, static_vy;
     ego_calib.getStaticParticleVelocity(static_vx, static_vy);
+    
+    // 2. 속도 분포 설정 (기존 로직 유지)
     std::normal_distribution<double> static_vel_dist_x(static_vx, newborn_vel_stddev);
     std::normal_distribution<double> static_vel_dist_y(static_vy, newborn_vel_stddev);
-    std::normal_distribution<double> dynamic_noise_dist(0.0, newborn_vel_stddev);
+    // 동적 파티클은 방향성 없이 랜덤하게 퍼짐 (Zero Mean + Large Stddev)
     std::normal_distribution<double> dynamic_fallback_dist(0.0, dynamic_newborn_vel_stddev);
+
+    // [수정 핵심] 위치 랜덤 분포 추가 (Uniform Distribution)
+    // 파티클 생성 위치를 셀 중심에서 셀 크기(resolution) 전체 영역으로 확장
+    // 범위: [-resolution_/2.0, +resolution_/2.0]
+    std::uniform_real_distribution<double> pos_dist(-resolution_ / 2.0, resolution_ / 2.0);
 
     for (int y = 0; y < grid_height_; ++y) {
         for (int x = 0; x < grid_width_; ++x) {
             int idx = gridToIndex(x, y);
             const auto& cell = grid_[idx];
 
+            // 탄생(Birth) 조건: 확률 질량(rho_b)이 충분하고 점유된 셀일 때
             if (cell.rho_b > 0.5 && cell.m_occ > 0.6) {
                 int num_to_birth = static_cast<int>(std::ceil(cell.rho_b * 4.0));
                 
-                // Max Speed Search (CalculateVelocityStatistics와 동일 로직)
+                // [Radar Hint 로직] - 여기서는 동적 파티클 비율 계산에만 사용 (기존 유지)
                 double max_comp_speed = 0.0;
                 if (use_radar_) {
                     for (int dy = -radar_hint_search_radius_; dy <= radar_hint_search_radius_; ++dy) {
@@ -423,6 +606,7 @@ std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_st
                     }
                 }
 
+                // 동적 파티클 비율 결정
                 double current_dynamic_ratio = min_dynamic_birth_ratio;
                 if (max_comp_speed > 1e-6) {
                     double scale = std::min(1.0, max_comp_speed / std::max(1e-6, max_radar_speed_for_scaling));
@@ -432,28 +616,37 @@ std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_st
                 int num_dynamic = static_cast<int>(num_to_birth * current_dynamic_ratio);
                 int num_static = num_to_birth - num_dynamic;
 
-                // Create Static
+                // 3. 정적 파티클 생성 (Static Particles)
                 for (int i = 0; i < num_static; ++i) {
                     Particle p;
-                    gridToWorld(x, y, p.x, p.y);
+                    gridToWorld(x, y, p.x, p.y); // 셀 중심 좌표 할당
+                    
+                    // [적용] 위치 랜덤 노이즈 추가 -> 셀 전체 영역에 분포
+                    p.x += pos_dist(random_generator_);
+                    p.y += pos_dist(random_generator_);
+                    
                     p.vx = static_vel_dist_x(random_generator_);
                     p.vy = static_vel_dist_y(random_generator_);
                     p.weight = cell.rho_b / static_cast<double>(num_to_birth);
-                    p.grid_cell_idx = idx;
-                    p.age = 0;
+                    p.grid_cell_idx = idx; p.age = 0;
                     new_particles.push_back(p);
                 }
-                
-                // Create Dynamic
+
+                // 4. 동적 파티클 생성 (Dynamic Particles)
                 for (int i = 0; i < num_dynamic; ++i) {
                     Particle p;
-                    gridToWorld(x, y, p.x, p.y);
-                    // 기존 로직 유지 (랜덤 생성)
+                    gridToWorld(x, y, p.x, p.y); // 셀 중심 좌표 할당
+                    
+                    // [적용] 위치 랜덤 노이즈 추가 -> 셀 전체 영역에 분포 (탈출 확률 확보)
+                    p.x += pos_dist(random_generator_);
+                    p.y += pos_dist(random_generator_);
+
+                    // 속도는 기존과 동일하게 랜덤 분포 사용 (방향성 없음)
                     p.vx = dynamic_fallback_dist(random_generator_) + static_vx; 
                     p.vy = dynamic_fallback_dist(random_generator_) + static_vy; 
+                    
                     p.weight = cell.rho_b / static_cast<double>(num_to_birth);
-                    p.grid_cell_idx = idx;
-                    p.age = 0;
+                    p.grid_cell_idx = idx; p.age = 0;
                     new_particles.push_back(p);
                 }
             }
@@ -463,7 +656,6 @@ std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_st
 }
 
 void DynamicGridMap::toOccupancyGridMsg(nav_msgs::OccupancyGrid& msg, const std::string& frame_id) const {
-    // (이전과 동일 - 생략 가능하나 전체 복사 요청하셨으므로 포함)
     msg.header.stamp = ros::Time::now();
     msg.header.frame_id = frame_id;
     msg.info.resolution = resolution_;
@@ -490,7 +682,6 @@ void DynamicGridMap::toMarkerArrayMsg(visualization_msgs::MarkerArray& arr,
                                       const std::string& frame_id,
                                       bool show_velocity_arrows,
                                       const EgoCalibration& ego_calib) const {
-    // (이전과 동일 - 생략)
     arr.markers.clear();
     visualization_msgs::Marker cubes;
     cubes.header.stamp = ros::Time::now(); cubes.header.frame_id = frame_id; cubes.ns = "dogm_cells"; cubes.id = 0;
@@ -553,10 +744,8 @@ void DynamicGridMap::shiftGrid(double dx, double dy) {
                 int new_idx = gridToIndex(x, y); int old_idx = gridToIndex(old_x, old_y);
                 new_grid[new_idx] = grid_[old_idx];
                 new_meas[new_idx] = measurement_grid_[old_idx];
-                // Shift Radar Buffers
                 for(auto& p : new_grid[new_idx].radar_buffer_1) { p.x -= dx; p.y -= dy; }
                 for(auto& p : new_grid[new_idx].radar_buffer_2) { p.x -= dx; p.y -= dy; }
-                // Hints are recomputed every step, no need to shift
             }
         }
     }

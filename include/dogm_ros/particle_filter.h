@@ -3,7 +3,13 @@
 
 #include <vector>
 #include <random>
+#include <cmath>
 #include "structures.h"
+
+// Ensure M_PI is defined
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 class DynamicGridMap; // Forward declaration
 
@@ -26,6 +32,17 @@ public:
     
     void resample(const std::vector<Particle>& new_born_particles);
 
+    /**
+     * @brief Checks if a candidate particle matches the winner within the sector gate.
+     * * @param winner The reference particle (highest weight).
+     * @param candidate The particle to check.
+     * @param vel_thresh Allowed velocity magnitude difference [m/s].
+     * @param ang_thresh_deg Allowed angle difference [degrees].
+     * @return true If both magnitude and angle conditions are met.
+     */
+    bool checkSectorMatch(const Particle& winner, const Particle& candidate, 
+                          double vel_thresh, double ang_thresh_deg);
+
     std::vector<Particle>& getParticles() { return particles_; }
     const std::vector<Particle>& getParticles() const { return particles_; }
 
@@ -39,6 +56,10 @@ private:
     
     std::normal_distribution<double> pos_noise_dist_;
     std::normal_distribution<double> vel_noise_dist_;
+
+    // Helper functions
+    double normalizeAngle(double angle);
+    double angleDiff(double a1, double a2);
 };
 
 #endif // PARTICLE_FILTER_H

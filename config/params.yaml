@@ -7,8 +7,8 @@
 lidar_topic: "/scan"                     
 radar_topic_1: "/ti_mmwave/radar_scan_pcl_0" 
 radar_topic_2: "/ti_mmwave/radar_scan_pcl_1" 
-radar_frame_1: "radar_1"                 # URDF에 정의된 Link 이름 (우측)
-radar_frame_2: "radar_2"                 # URDF에 정의된 Link 이름 (좌측)
+radar_frame_1: "radar_1"                 
+radar_frame_2: "radar_2"                 
 
 grid_topic: "/dogm/grid"                 
 marker_topic: "/dogm/markers"            
@@ -18,7 +18,7 @@ odom_topic: "/odometry/filtered"
 # 2. Grid Map & Filter Base Settings
 # -------------------------------------------------------------------
 grid_size: 3.0                           
-grid_resolution: 0.15                    
+grid_resolution: 0.15                   
 filter_update_rate: 10.0                 
 num_particles: 20000                   
 max_velocity: 2                          
@@ -29,13 +29,13 @@ max_velocity: 2
 # 3.1. Step 1: Measurement Model
 use_radar: true                          
 lidar_hit_point: 5                       
-lidar_noise_stddev: 0.03                 
-radar_buffer_size: 5                     
+lidar_noise_stddev: 0.05                 
+radar_buffer_size: 2                     
 min_radar_points: 2                      
 
 # 3.2. Step 2: Particle Prediction
 process_noise_pos: 0.06                   
-process_noise_vel: 0.30                  
+process_noise_vel: 0.10                  
 persistence_prob: 0.95                  
 velocity_damping_threshold: 0.2          
 velocity_damping_factor: 0.2             
@@ -49,15 +49,24 @@ birth_prob: 0.02
 # 3.5. Step 5: Cell Classification
 particle_static_velocity_threshold: 0.2
 radar_static_velocity_threshold: 0.2
-mode_cluster_velocity_thresh: 0.3
+
+# [Changed] Sector Gating Thresholds for Winner Clustering
+# particle_vector_Velthresh: Allowed speed difference [m/s]
+# particle_vector_Angthresh: Allowed angle difference [degrees]
+particle_vector_Velthresh: 0.3
+particle_vector_Angthresh: 5.0
+
 radar_hint_search_radius: 2
-use_measurement_correction: true
-use_false_static_detection: true
+use_measurement_correction: false
+use_false_static_detection: false
 fsd_T_static: 2                          
 fsd_T_free: 2                            
 
+# Cluster Mode (True: Object-Level, False: Cell-Level)
+cluster_mode: true
+
 # 3.6. Step 6: Particle Generation
-min_dynamic_birth_ratio: 0.3  
+min_dynamic_birth_ratio: 0.2  
 max_dynamic_birth_ratio: 0.9  
 max_radar_speed_for_scaling: 1.0  
 newborn_vel_stddev: 0.3

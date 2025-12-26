@@ -15,7 +15,7 @@
 #include "dogm_ros/particle_filter.h"
 #include "dogm_ros/ego_calibration.h"
 
-// [신규] 레이다 데이터 패킷 (Cloud + Sensor Origin)
+// [Dual Radar] Radar Data Structure
 struct RadarDataPacket {
     pcl::PointCloud<mmWaveCloudType>::ConstPtr cloud;
     double sensor_x;
@@ -33,12 +33,14 @@ public:
                    bool use_radar,
                    int lidar_hit_point,
                    double lidar_noise_stddev,
-                   double mode_cluster_velocity_thresh,
+                   // [Changed] Separated Thresholds
+                   double particle_vector_vel_thresh, 
+                   double particle_vector_ang_thresh,
                    double particle_static_vel_thresh,
-                   double radar_static_vel_thresh);
+                   double radar_static_vel_thresh,
+                   bool cluster_mode);
     ~DynamicGridMap() = default;
 
-    // [수정] 다중 레이다 데이터를 받도록 변경
     void generateMeasurementGrid(const sensor_msgs::LaserScan::ConstPtr& scan,
                                  const std::vector<RadarDataPacket>& radar_packets);
 
@@ -72,8 +74,11 @@ public:
     void indexToGrid(int idx, int& gx, int& gy) const;
     bool isInside(int gx, int gy) const;
 
+    int getRadarHintSearchRadius() const { return radar_hint_search_radius_; }
 
 private:
+    void processDynamicClusters(const EgoCalibration& ego_calib);
+
     double grid_size_;
     double resolution_;
     int grid_width_;
@@ -96,9 +101,15 @@ private:
     bool use_radar_;
     int lidar_hit_point_;
     double lidar_noise_stddev_;
-    double mode_cluster_velocity_thresh_sq_;
+    
+    // [Changed] New Threshold Variables
+    double particle_vector_vel_thresh_; 
+    double particle_vector_ang_thresh_; 
+
     double particle_static_vel_thresh_;
     double radar_static_vel_thresh_;
+    
+    bool cluster_mode_;
 };
 
 #endif // DYNAMIC_GRID_MAP_H

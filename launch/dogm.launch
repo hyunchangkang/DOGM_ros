@@ -13,7 +13,7 @@
 
   <node pkg="dogm_ros" type="radar_velocity_viz_node" name="radar_velocity_viz_node" output="screen">
       <param name="base_frame" value="$(arg base_frame)"/>
-      <param name="radar_viz_color_max_vel" value="1.0"/>
+      <param name="radar_viz_color_max_vel" value="3.0"/>
   </node>
 
 </launch>

@@ -28,16 +28,20 @@ public:
     DogmNode() : nh_(), pnh_("~"), last_ego_vx_(0.0), last_ego_vy_(0.0), tf_listener_(tf_buffer_)
     {
         loadParams();
+        
+        // [Modified] Passing separated thresholds to constructor
         grid_map_ = std::make_unique<DynamicGridMap>(
             grid_size_, grid_res_, num_particles_,
             process_noise_pos_, process_noise_vel_,
             radar_buffer_size_, min_radar_points_,
-            radar_hint_search_radius_,
+            radar_hint_search_radius_, 
             use_fsd_, fsd_T_static_, fsd_T_free_,
             use_mc_, use_radar_,
             lidar_hit_point_, lidar_noise_stddev_,
-            mode_cluster_velocity_thresh_,
-            particle_static_vel_thresh_, radar_static_vel_thresh_
+            particle_vector_vel_thresh_, // [New]
+            particle_vector_ang_thresh_, // [New]
+            particle_static_vel_thresh_, radar_static_vel_thresh_,
+            cluster_mode_ 
         );
         
         grid_pub_   = nh_.advertise<nav_msgs::OccupancyGrid>(grid_topic_, 1);
@@ -45,7 +49,6 @@ public:
         scan_sub_ = nh_.subscribe<sensor_msgs::LaserScan>(lidar_topic_, 1, &DogmNode::scanCb, this);
 
         if (use_radar_) {
-            // [수정] 듀얼 레이다 구독
             radar_sub_1_ = nh_.subscribe<sensor_msgs::PointCloud2>(radar_topic_1_, 1, &DogmNode::radar1Cb, this);
             radar_sub_2_ = nh_.subscribe<sensor_msgs::PointCloud2>(radar_topic_2_, 1, &DogmNode::radar2Cb, this);
             ROS_INFO("Dual Radar fusion is ENABLED.");
@@ -70,10 +73,8 @@ private:
     void odomCb(const nav_msgs::Odometry::ConstPtr& msg) {
         if (!msg) return;
         ego_calib_.update(msg->twist.twist.linear.x, msg->twist.twist.linear.y);
-        // (Visualizaton Code 생략 - 원본 유지 가능)
     }
 
-    // [수정] 레이다 1 콜백
     void radar1Cb(const sensor_msgs::PointCloud2::ConstPtr& msg) {
         if (!use_radar_) return;
         last_radar_cloud_1_.reset(new pcl::PointCloud<mmWaveCloudType>());
@@ -81,7 +82,6 @@ private:
         has_radar_1_ = !last_radar_cloud_1_->points.empty();
     }
 
-    // [수정] 레이다 2 콜백
     void radar2Cb(const sensor_msgs::PointCloud2::ConstPtr& msg) {
         if (!use_radar_) return;
         last_radar_cloud_2_.reset(new pcl::PointCloud<mmWaveCloudType>());
@@ -89,7 +89,6 @@ private:
         has_radar_2_ = !last_radar_cloud_2_->points.empty();
     }
 
-    // Helper to transform cloud and get sensor origin
     bool processRadarData(const pcl::PointCloud<mmWaveCloudType>::Ptr& cloud, 
                           const std::string& target_frame, 
                           const std::string& sensor_frame,
@@ -97,17 +96,11 @@ private:
     {
         if (!cloud || cloud->points.empty()) return false;
 
-        // 1. Get Sensor Origin in Base Frame
         try {
             geometry_msgs::TransformStamped transform = tf_buffer_.lookupTransform(target_frame, sensor_frame, ros::Time(0));
             packet.sensor_x = transform.transform.translation.x;
             packet.sensor_y = transform.transform.translation.y;
 
-            // 2. Transform Cloud Points manually or using PCL (Here manual for simplicity assuming static tf)
-            // But since input cloud is already likely in sensor frame, we need to transform points to base_link
-            // Note: If radar driver outputs in sensor frame, we transform.
-            
-            // Transform matrix
              Eigen::Affine3d tf_eigen;
              tf_eigen = tf2::transformToEigen(transform);
              
@@ -129,12 +122,10 @@ private:
         if (dt <= 0.0) return;
         last_update_time_ = now;
 
-        // 1. Grid Shift
         double dx, dy; int sx, sy;
         ego_calib_.getGridShift(dt, grid_res_, sx, sy, dx, dy);
         grid_map_->shiftGrid(dx, dy);
 
-        // 2. Measurement Preparation
         std::vector<RadarDataPacket> radar_packets;
         if (use_radar_) {
             RadarDataPacket p1, p2;
@@ -146,14 +137,11 @@ private:
             }
         }
         
-        // 3. Measurement Update
         grid_map_->generateMeasurementGrid(last_scan_, radar_packets);
         
-        // Flags reset
         has_radar_1_ = false; 
         has_radar_2_ = false;
 
-        // 4. Predict
         double curr_vx = ego_calib_.getVx();
         double curr_vy = ego_calib_.getVy();
         double d_vx = curr_vx - last_ego_vx_;
@@ -165,14 +153,11 @@ private:
         pf.predict(dt, persistence_prob_, velocity_damping_threshold_, 
                    velocity_damping_factor_, max_velocity_, d_vx, d_vy);
 
-        // 5. Update & Resample
         pf.sortParticlesByGridCell(*grid_map_);
-        // [수정] radar_noise_stddev 전달
         pf.updateWeights(grid_map_->getMeasurementGrid(), grid_map_->getGrid(), *grid_map_, radar_noise_stddev_);
         
         grid_map_->updateOccupancy(birth_prob_);
         
-        // 6. Stats & Birth
         grid_map_->calculateVelocityStatistics(max_vel_for_scaling_, use_ego_comp_, ego_calib_);
         
         auto new_borns = grid_map_->generateNewParticles(
@@ -182,7 +167,6 @@ private:
         
         pf.resample(new_borns);
 
-        // 7. Publish
         nav_msgs::OccupancyGrid grid_msg;
         grid_map_->toOccupancyGridMsg(grid_msg, base_frame_);
         grid_pub_.publish(grid_msg);
@@ -197,7 +181,6 @@ private:
     void loadParams() {
         pnh_.param("use_radar", use_radar_, true);
         pnh_.param("lidar_topic", lidar_topic_, std::string("/scan"));
-        // [수정] 듀얼 레이다 토픽 및 프레임
         pnh_.param("radar_topic_1", radar_topic_1_, std::string("/ti_mmwave/radar_scan_pcl_0"));
         pnh_.param("radar_topic_2", radar_topic_2_, std::string("/ti_mmwave/radar_scan_pcl_1"));
         pnh_.param("radar_frame_1", radar_frame_1_, std::string("radar_1"));
@@ -221,10 +204,14 @@ private:
         pnh_.param("velocity_damping_factor", velocity_damping_factor_, 0.2);
         pnh_.param("particle_static_velocity_threshold", particle_static_vel_thresh_, 0.3);
         pnh_.param("radar_static_velocity_threshold", radar_static_vel_thresh_, 0.5);
-        pnh_.param("mode_cluster_velocity_thresh", mode_cluster_velocity_thresh_, 0.3);
+        
+        // [Modified] New Thresholds for Sector Gating
+        pnh_.param("particle_vector_Velthresh", particle_vector_vel_thresh_, 0.3); 
+        pnh_.param("particle_vector_Angthresh", particle_vector_ang_thresh_, 30.0);
+
         pnh_.param("radar_buffer_size", radar_buffer_size_, 5);
         pnh_.param("min_radar_points", min_radar_points_, 2);
-        pnh_.param("radar_hint_search_radius", radar_hint_search_radius_, 2);
+        pnh_.param("radar_hint_search_radius", radar_hint_search_radius_, 2); 
         pnh_.param("min_dynamic_birth_ratio", min_dynamic_birth_ratio_, 0.1);
         pnh_.param("max_dynamic_birth_ratio", max_dynamic_birth_ratio_, 0.9);
         pnh_.param("max_radar_speed_for_scaling", max_radar_speed_for_scaling_, 1.0);
@@ -241,11 +228,13 @@ private:
         pnh_.param("ego_vel_marker_topic", ego_vel_marker_topic_, std::string("/dogm/ego_velocity_arrow"));
         pnh_.param("lidar_hit_point", lidar_hit_point_, 5);
         pnh_.param("lidar_noise_stddev", lidar_noise_stddev_, 0.1);
+
+        pnh_.param("cluster_mode", cluster_mode_, false);
     }
 
     ros::NodeHandle nh_, pnh_;
     ros::Subscriber scan_sub_, odom_sub_;
-    ros::Subscriber radar_sub_1_, radar_sub_2_; // Two subs
+    ros::Subscriber radar_sub_1_, radar_sub_2_;
     ros::Publisher  grid_pub_, marker_pub_, ego_vel_pub_;
     ros::Timer      timer_;
     std::unique_ptr<DynamicGridMap> grid_map_;
@@ -271,7 +260,11 @@ private:
     double dynamic_newborn_vel_stddev_;
     double velocity_damping_threshold_, velocity_damping_factor_;
     double max_vel_for_scaling_;
-    double mode_cluster_velocity_thresh_;
+    
+    // [Modified] Replaced old thresh with new ones
+    double particle_vector_vel_thresh_;
+    double particle_vector_ang_thresh_;
+
     bool show_velocity_arrows_, use_ego_comp_;
     int radar_buffer_size_, min_radar_points_, radar_hint_search_radius_;
     double radar_noise_stddev_;
@@ -283,6 +276,8 @@ private:
     double lidar_noise_stddev_;
     double particle_static_vel_thresh_;
     double radar_static_vel_thresh_;
+    
+    bool cluster_mode_;
 
     sensor_msgs::LaserScan::ConstPtr last_scan_;
     pcl::PointCloud<mmWaveCloudType>::Ptr last_radar_cloud_1_;

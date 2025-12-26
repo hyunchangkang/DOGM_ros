@@ -5,13 +5,15 @@
 #include <sensor_msgs/PointCloud2.h>
 #include <visualization_msgs/Marker.h>
 #include <string>
-#include <pcl_conversions/pcl_conversions.h> // Include for PCL conversion
-#include <limits> // Include for numeric_limits
-// [NEW] Deque (양방향 큐) 헤더 추가 (버퍼로 사용)
-#include <deque> 
-// [NEW] PCL PointCloud 헤더 추가 (버퍼에 PCL 클라우드를 저장하기 위함)
+#include <deque>
+#include <limits>
+#include <pcl_ros/transforms.h>
+#include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
-// Include structure definitions (adjust path if necessary)
+#include <tf2_ros/transform_listener.h>
+#include <tf2_sensor_msgs/tf2_sensor_msgs.h>
+#include <geometry_msgs/TransformStamped.h>
+
 #include "dogm_ros/structures.h"
 
 // Class for the Radar Velocity Visualization Node
@@ -22,8 +24,12 @@ public:
     RadarVizNode();
 
 private:
-    // Callback function for incoming radar point clouds
-    void radarCb(const sensor_msgs::PointCloud2::ConstPtr& msg);
+    // Callback functions for incoming radar point clouds (Dual Radar)
+    void radar1Cb(const sensor_msgs::PointCloud2::ConstPtr& msg);
+    void radar2Cb(const sensor_msgs::PointCloud2::ConstPtr& msg);
+
+    // Common processing function to transform and buffer data
+    void processRadar(const sensor_msgs::PointCloud2::ConstPtr& msg, const std::string& sensor_frame);
 
     // Loads parameters from the parameter server
     void loadParams();
@@ -35,17 +41,31 @@ private:
     ros::NodeHandle nh_;
     ros::NodeHandle pnh_;
 
-    // Subscriber and Publisher
-    ros::Subscriber radar_sub_;
+    // Subscribers (Dual Radar)
+    ros::Subscriber radar_sub_1_;
+    ros::Subscriber radar_sub_2_;
+    
+    // Publisher
     ros::Publisher radar_viz_pub_;
 
+    // TF Buffer & Listener for coordinate transformation
+    tf2_ros::Buffer tf_buffer_;
+    tf2_ros::TransformListener tf_listener_;
+
     // Parameters
-    std::string radar_topic_;         // Topic to subscribe radar data from
+    bool use_radar_;
+    std::string radar_topic_1_;       
+    std::string radar_topic_2_;
+    std::string radar_frame_1_;
+    std::string radar_frame_2_;
+    
     std::string radar_viz_topic_;     // Topic to publish visualization markers to
-    std::string base_frame_;          // Frame ID for the markers
-    double radar_viz_lifetime_;       // How long markers should persist in RViz (seconds)
-    double radar_viz_color_max_vel_; // Speed (m/s) corresponding to the 'reddest' color
-    int viz_buffer_size_; // 몇 개의 스캔을 누적할지
+    std::string base_frame_;          // Target frame ID (e.g., base_link)
+    double radar_viz_lifetime_;       // How long markers should persist in RViz
+    double radar_viz_color_max_vel_;  // Speed for max color intensity
+    int viz_buffer_size_;             // Number of scans to buffer
+
+    // Buffer to store TRANSFORMED point clouds
     std::deque<pcl::PointCloud<mmWaveCloudType>::Ptr> cloud_buffer_;
 };
 
