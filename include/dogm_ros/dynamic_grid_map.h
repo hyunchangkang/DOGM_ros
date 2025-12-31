@@ -20,6 +20,7 @@ struct RadarDataPacket {
     pcl::PointCloud<mmWaveCloudType>::ConstPtr cloud;
     double sensor_x;
     double sensor_y;
+    double sensor_yaw;  // Sensor orientation (rotation around Z-axis)
 };
 
 class DynamicGridMap {

@@ -60,17 +60,18 @@ struct RadarPoint
  */
 struct RadarHint {
     double vr;          // Mean radial velocity
-    double sensor_x;    // Sensor origin X for azimuth calculation
-    double sensor_y;    // Sensor origin Y for azimuth calculation
+    double sensor_x;    // Sensor origin X
+    double sensor_y;    // Sensor origin Y
+    double sensor_yaw;  // Sensor orientation (rotation around Z-axis)
     bool valid{false};
 
-    // [Optimization] Pre-computed trigonometric values
-    double obs_cos_theta{0.0};
-    double obs_sin_theta{0.0};
+    // [Optimization] Pre-computed sensor direction (for likelihood calculation)
+    double sensor_cos_yaw{0.0};  // cos(sensor_yaw)
+    double sensor_sin_yaw{0.0};  // sin(sensor_yaw)
     
     // Default constructor explicitly
-    RadarHint() : vr(0.0), sensor_x(0.0), sensor_y(0.0), valid(false),
-                  obs_cos_theta(0.0), obs_sin_theta(0.0) {}
+    RadarHint() : vr(0.0), sensor_x(0.0), sensor_y(0.0), sensor_yaw(0.0), valid(false),
+                  sensor_cos_yaw(1.0), sensor_sin_yaw(0.0) {}
 };
 
 /**

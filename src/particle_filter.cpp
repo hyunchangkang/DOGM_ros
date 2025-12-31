@@ -109,9 +109,11 @@ void ParticleFilter::updateWeights(const std::vector<MeasurementCell>& measureme
                 }
 
                 // 2. Radar Likelihood
-                // Initialized to 1.0 (identity for multiplication).
-                // If no valid radar hints are found, it remains 1.0 (neutral).
-                double radar_likelihood = 1.0; 
+                // Calculate likelihood separately for each sensor, then combine.
+                // Sensor 1 and Sensor 2 measurements are independent (can be multiplied).
+                // Within each sensor, multiple hints are correlated (use geometric mean).
+                double log_sum_s1 = 0.0, log_sum_s2 = 0.0;
+                int count_s1 = 0, count_s2 = 0;
                 
                 int p_gx, p_gy;
                 grid_map.indexToGrid(p.grid_cell_idx, p_gx, p_gy);
@@ -126,29 +128,50 @@ void ParticleFilter::updateWeights(const std::vector<MeasurementCell>& measureme
                         const auto& neighbor_cell = grid[grid_map.gridToIndex(nx, ny)];
                         
                         if (!neighbor_cell.radar_hints.empty()) {
-                            for (const auto& hint : neighbor_cell.radar_hints) {
+                            // Determine which sensor(s) contributed hints in this cell
+                            // radar_hints[0] is from sensor_1 (radar_buffer_1)
+                            // radar_hints[1] is from sensor_2 (radar_buffer_2) if it exists
+                            
+                            for (size_t hint_idx = 0; hint_idx < neighbor_cell.radar_hints.size(); ++hint_idx) {
+                                const auto& hint = neighbor_cell.radar_hints[hint_idx];
+                                
                                 // [Filtering] Ignore low radial velocity measurements.
                                 // If abs(vr) < 0.1, it's likely lateral motion (Doppler ~ 0) or static clutter.
                                 // We skip these to prevent them from killing dynamic particles.
                                 if (std::abs(hint.vr) < 0.1) continue;
 
                                 // B. Expected Radial Velocity Calculation
-                                // Uses pre-computed trigonometric values (obs_cos_theta, obs_sin_theta)
-                                // to avoid expensive 'atan2', 'cos', 'sin' calls inside the loop.
-                                // Formula: vr_exp = vx * cos(theta) + vy * sin(theta)
-                                double vr_expected = p.vx * hint.obs_cos_theta + p.vy * hint.obs_sin_theta;
+                                // Radar measures velocity component along sensor's forward direction (local X-axis)
+                                // The sensor direction is defined by sensor_yaw (rotation around Z-axis)
+                                // Formula: vr_exp = velocity · sensor_direction
+                                //                 = vx * cos(sensor_yaw) + vy * sin(sensor_yaw)
+                                double vr_expected = p.vx * hint.sensor_cos_yaw + p.vy * hint.sensor_sin_yaw;
                                 
                                 // C. Probability Calculation
                                 double error = vr_expected - hint.vr;
                                 double prob = std::exp(error * error * radar_norm_factor);
+                                prob = std::max(prob, MIN_RADAR_PROB);
                                 
-                                // D. Update Likelihood (Product Rule)
-                                // Use MIN_RADAR_PROB to prevent likelihood from becoming zero.
-                                radar_likelihood *= std::max(prob, MIN_RADAR_PROB);
+                                // D. Accumulate log-probability for geometric mean
+                                // Separate by sensor: hint_idx 0 is sensor_1, hint_idx 1 is sensor_2
+                                if (hint_idx == 0) {
+                                    log_sum_s1 += std::log(prob + 1e-10);
+                                    count_s1++;
+                                } else {
+                                    log_sum_s2 += std::log(prob + 1e-10);
+                                    count_s2++;
+                                }
                             }
                         }
                     }
                 }
+                
+                // E. Compute per-sensor likelihoods using geometric mean
+                double likelihood_s1 = (count_s1 > 0) ? std::exp(log_sum_s1 / count_s1) : 1.0;
+                double likelihood_s2 = (count_s2 > 0) ? std::exp(log_sum_s2 / count_s2) : 1.0;
+                
+                // F. Combine independent sensor likelihoods
+                double radar_likelihood = likelihood_s1 * likelihood_s2;
 
                 // 3. Final Weight Update
                 // Combine LiDAR and Radar likelihoods.

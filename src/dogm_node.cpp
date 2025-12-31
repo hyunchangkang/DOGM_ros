@@ -14,6 +14,8 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
 
 #include <tf2_eigen/tf2_eigen.h>
 #include <pcl/common/transforms.h>
@@ -100,6 +102,18 @@ private:
             geometry_msgs::TransformStamped transform = tf_buffer_.lookupTransform(target_frame, sensor_frame, ros::Time(0));
             packet.sensor_x = transform.transform.translation.x;
             packet.sensor_y = transform.transform.translation.y;
+            
+            // Extract sensor orientation (yaw angle from quaternion)
+            tf2::Quaternion q(
+                transform.transform.rotation.x,
+                transform.transform.rotation.y,
+                transform.transform.rotation.z,
+                transform.transform.rotation.w
+            );
+            tf2::Matrix3x3 m(q);
+            double roll, pitch, yaw;
+            m.getRPY(roll, pitch, yaw);
+            packet.sensor_yaw = yaw;
 
              Eigen::Affine3d tf_eigen;
              tf_eigen = tf2::transformToEigen(transform);

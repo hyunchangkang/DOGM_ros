@@ -7,6 +7,9 @@
 #include <queue> 
 #include <map>
 
+#define ONE_ARROW       1
+#define BOUNDING_BOX    1  // 1: 바운딩 박스 표시, 0: 바운딩 박스 숨김
+
 DynamicGridMap::DynamicGridMap(double grid_size, double resolution, int num_particles,
                                double process_noise_pos, double process_noise_vel,
                                int radar_buffer_size, int min_radar_points,
@@ -99,7 +102,7 @@ void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::Const
         }
     }
 
-    auto processBuffer = [&](const std::vector<RadarPoint>& buffer, double sx, double sy, int min_pts) -> RadarHint 
+    auto processBuffer = [&](const std::vector<RadarPoint>& buffer, double sx, double sy, double syaw, int min_pts) -> RadarHint 
     {
         RadarHint hint;
         if (buffer.size() < static_cast<size_t>(min_pts)) return hint;
@@ -117,17 +120,14 @@ void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::Const
         double mean_y = sum_y / buffer.size();
         
         hint.sensor_x = sx; 
-        hint.sensor_y = sy; 
+        hint.sensor_y = sy;
+        hint.sensor_yaw = syaw;
         hint.valid = true;
 
-        // 2. [핵심 수정] 관측 무게중심을 기준으로 '각도'를 확정 (파티클 위치 무관)
-        double dx = mean_x - sx;
-        double dy = mean_y - sy;
-        double angle = std::atan2(dy, dx); // 센서 -> 관측점 절대 각도
-
-        // 3. 파티클 필터용 삼각함수 값 미리 계산 (최적화 & 안정화)
-        hint.obs_cos_theta = std::cos(angle);
-        hint.obs_sin_theta = std::sin(angle);
+        // 2. [수정] 센서 방향 벡터 사전 계산 (센서 정면 = 로컬 X축)
+        // 센서가 바라보는 방향의 단위 벡터
+        hint.sensor_cos_yaw = std::cos(syaw);
+        hint.sensor_sin_yaw = std::sin(syaw);
 
         return hint;
     };
@@ -135,11 +135,13 @@ void DynamicGridMap::generateMeasurementGrid(const sensor_msgs::LaserScan::Const
     for (int idx = 0; idx < grid_.size(); ++idx) {
         auto& c = grid_[idx];
         if (radar_packets.size() > 0) {
-            RadarHint h1 = processBuffer(c.radar_buffer_1, radar_packets[0].sensor_x, radar_packets[0].sensor_y, min_radar_points_);
+            RadarHint h1 = processBuffer(c.radar_buffer_1, radar_packets[0].sensor_x, radar_packets[0].sensor_y, 
+                                         radar_packets[0].sensor_yaw, min_radar_points_);
             if (h1.valid) c.radar_hints.push_back(h1);
         }
         if (radar_packets.size() > 1) {
-            RadarHint h2 = processBuffer(c.radar_buffer_2, radar_packets[1].sensor_x, radar_packets[1].sensor_y, min_radar_points_);
+            RadarHint h2 = processBuffer(c.radar_buffer_2, radar_packets[1].sensor_x, radar_packets[1].sensor_y,
+                                         radar_packets[1].sensor_yaw, min_radar_points_);
             if (h2.valid) c.radar_hints.push_back(h2);
         }
     }
@@ -370,132 +372,36 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
     }
 }
 
-
-// void DynamicGridMap::processDynamicClusters(const EgoCalibration& ego_calib) {
-//     auto& parts = particle_filter_->getParticles();
-    
-//     // 1. Pre-compute particle ranges for each cell (Efficiency O(N))
-//     // parts is sorted by grid_cell_idx. We build a map: cell_idx -> {start_idx, end_idx}
-//     std::vector<std::pair<int, int>> cell_particle_ranges(grid_.size(), {-1, -1});
-    
-//     int current_cell = -1;
-//     int start_p = 0;
-//     for (int i = 0; i <= static_cast<int>(parts.size()); ++i) {
-//         bool last = (i == static_cast<int>(parts.size()));
-//         int c_idx = last ? -1 : parts[i].grid_cell_idx;
-        
-//         if (last || c_idx != current_cell) {
-//             if (current_cell >= 0 && current_cell < static_cast<int>(grid_.size())) {
-//                 cell_particle_ranges[current_cell] = {start_p, i};
-//             }
-//             current_cell = c_idx;
-//             start_p = i;
-//         }
-//     }
-
-//     // 2. BFS Clustering
-//     std::vector<bool> visited(grid_.size(), false);
-    
-//     for (int i = 0; i < grid_.size(); ++i) {
-//         // Only process dynamic cells that haven't been visited
-//         if (visited[i] || !grid_[i].is_dynamic) continue;
-        
-//         // Start new cluster
-//         std::vector<int> cluster_indices;
-//         std::queue<int> q;
-        
-//         q.push(i);
-//         visited[i] = true;
-        
-//         while (!q.empty()) {
-//             int curr = q.front(); q.pop();
-//             cluster_indices.push_back(curr);
-            
-//             int gx, gy; indexToGrid(curr, gx, gy);
-            
-//             // 8-Connectivity Search
-//             for (int dy = -1; dy <= 1; ++dy) {
-//                 for (int dx = -1; dx <= 1; ++dx) {
-//                     if (dx == 0 && dy == 0) continue;
-//                     int nx = gx + dx; int ny = gy + dy;
-                    
-//                     if (isInside(nx, ny)) {
-//                         int nidx = gridToIndex(nx, ny);
-//                         if (!visited[nidx] && grid_[nidx].is_dynamic) {
-//                             visited[nidx] = true;
-//                             q.push(nidx);
-//                         }
-//                     }
-//                 }
-//             }
-//         }
-        
-//         // 3. Process the Cluster
-//         if (cluster_indices.empty()) continue;
-
-//         // A. Find "Global Winner" in the entire cluster
-//         double global_max_weight = -1.0;
-//         int global_winner_p_idx = -1;
-
-//         // Iterate all cells in cluster to find winner particle
-//         for (int c_idx : cluster_indices) {
-//             std::pair<int, int> range = cell_particle_ranges[c_idx];
-//             if (range.first == -1) continue; // No particles in this cell
-
-//             for (int p_idx = range.first; p_idx < range.second; ++p_idx) {
-//                 if (parts[p_idx].weight > global_max_weight) {
-//                     global_max_weight = parts[p_idx].weight;
-//                     global_winner_p_idx = p_idx;
-//                 }
-//             }
-//         }
-
-//         if (global_winner_p_idx == -1) continue; // Should not happen if dynamic
-
-//         const Particle& global_winner = parts[global_winner_p_idx];
-
-//         // B. Calculate Cluster Mean Velocity using Sector Gating
-//         double cluster_vx_sum = 0.0;
-//         double cluster_vy_sum = 0.0;
-//         double cluster_w_sum = 0.0;
-
-//         for (int c_idx : cluster_indices) {
-//             std::pair<int, int> range = cell_particle_ranges[c_idx];
-//             if (range.first == -1) continue;
-
-//             for (int p_idx = range.first; p_idx < range.second; ++p_idx) {
-//                 // Check Sector Match (0.1 m/s, 60.0 deg) against Global Winner
-//                 if (particle_filter_->checkSectorMatch(global_winner, parts[p_idx], 
-//                                                        particle_vector_vel_thresh_, 
-//                                                        particle_vector_ang_thresh_)) 
-//                 {
-//                     cluster_vx_sum += parts[p_idx].vx * parts[p_idx].weight;
-//                     cluster_vy_sum += parts[p_idx].vy * parts[p_idx].weight;
-//                     cluster_w_sum  += parts[p_idx].weight;
-//                 }
-//             }
-//         }
-
-//         // C. Update Constituent Cells
-//         if (cluster_w_sum > 1e-9) {
-//             double cluster_mean_vx = cluster_vx_sum / cluster_w_sum;
-//             double cluster_mean_vy = cluster_vy_sum / cluster_w_sum;
-
-//             // Apply unified velocity to all cells in the cluster
-//             for (int c_idx : cluster_indices) {
-//                 grid_[c_idx].mean_vx = cluster_mean_vx;
-//                 grid_[c_idx].mean_vy = cluster_mean_vy;
-//             }
-//         }
-//     }
-// }
-
 void DynamicGridMap::processDynamicClusters(const EgoCalibration& ego_calib) {
-    // 1. BFS Clustering (기존과 동일: 8-이웃 연결성으로 동적 셀 그룹화)
+    auto& parts = particle_filter_->getParticles();
+    
+    // 1. [Efficiency] 셀별 파티클 인덱스 맵핑 (O(N))
+    // 전체 파티클을 매번 탐색하면 연산량이 많으므로, 각 셀별 파티클 구간을 미리 저장
+    std::vector<std::pair<int, int>> cell_particle_ranges(grid_.size(), {-1, -1});
+    int current_cell = -1;
+    int start_p = 0;
+    
+    // parts 벡터는 grid_cell_idx 순으로 정렬되어 있다고 가정
+    for (int i = 0; i <= static_cast<int>(parts.size()); ++i) {
+        bool last = (i == static_cast<int>(parts.size()));
+        int c_idx = last ? -1 : parts[i].grid_cell_idx;
+        if (last || c_idx != current_cell) {
+            if (current_cell >= 0 && current_cell < static_cast<int>(grid_.size())) {
+                cell_particle_ranges[current_cell] = {start_p, i};
+            }
+            current_cell = c_idx;
+            start_p = i;
+        }
+    }
+
+    // 2. BFS Clustering (2칸 반경으로 병합 - 두 발을 하나로 묶기 위함)
     std::vector<bool> visited(grid_.size(), false);
     
+    // [설정] 클러스터링 탐색 반경: 2칸 (Chebyshev distance 2)
+    const int cluster_search_radius = 2; 
+
     for (int i = 0; i < grid_.size(); ++i) {
-        // 이미 방문했거나 동적 셀이 아니면 건너뜀
+        // 이미 처리했거나 동적이 아닌 셀은 패스
         if (visited[i] || !grid_[i].is_dynamic) continue;
         
         std::vector<int> cluster_indices;
@@ -503,18 +409,20 @@ void DynamicGridMap::processDynamicClusters(const EgoCalibration& ego_calib) {
         q.push(i);
         visited[i] = true;
         
-        // BFS 탐색 시작
+        // --- BFS 탐색 시작 ---
         while (!q.empty()) {
             int curr = q.front(); q.pop();
             cluster_indices.push_back(curr);
             int gx, gy; indexToGrid(curr, gx, gy);
             
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
+            // 2칸 반경 이웃 탐색
+            for (int dy = -cluster_search_radius; dy <= cluster_search_radius; ++dy) {
+                for (int dx = -cluster_search_radius; dx <= cluster_search_radius; ++dx) {
                     if (dx == 0 && dy == 0) continue;
                     int nx = gx + dx; int ny = gy + dy;
                     if (isInside(nx, ny)) {
                         int nidx = gridToIndex(nx, ny);
+                        // 방문 안 했고, 동적 셀(is_dynamic)인 경우만 병합
                         if (!visited[nidx] && grid_[nidx].is_dynamic) {
                             visited[nidx] = true;
                             q.push(nidx);
@@ -524,33 +432,217 @@ void DynamicGridMap::processDynamicClusters(const EgoCalibration& ego_calib) {
             }
         }
         
-        // 2. [수정됨] 클러스터 처리: 단순 평균 계산 (Simple Average of Cell Velocities)
         if (cluster_indices.empty()) continue;
 
-        double cluster_vx_sum = 0.0;
-        double cluster_vy_sum = 0.0;
-        int count = 0;
+        // 3. [Consensus Step 1] 각 셀의 대표(Local Candidates) 선출
+        // 클러스터 내의 각 셀에서 가장 가중치가 높은 파티클을 후보로 뽑습니다.
+        std::vector<const Particle*> candidates;
+        candidates.reserve(cluster_indices.size());
 
-        // 클러스터 내에 속한 각 셀의 속도(이미 개별적으로 계산된 값)를 모두 더함
         for (int c_idx : cluster_indices) {
-             cluster_vx_sum += grid_[c_idx].mean_vx;
-             cluster_vy_sum += grid_[c_idx].mean_vy;
-             count++;
+            std::pair<int, int> range = cell_particle_ranges[c_idx];
+            if (range.first == -1) continue;
+
+            double local_max_weight = -1.0;
+            int local_winner_idx = -1;
+
+            // 해당 셀 안에서 1등 찾기
+            for (int p = range.first; p < range.second; ++p) {
+                if (parts[p].weight > local_max_weight) {
+                    local_max_weight = parts[p].weight;
+                    local_winner_idx = p;
+                }
+            }
+            if (local_winner_idx != -1) {
+                candidates.push_back(&parts[local_winner_idx]);
+            }
         }
 
-        // 3. 평균 속도 적용
-        if (count > 0) {
-            double cluster_mean_vx = cluster_vx_sum / static_cast<double>(count);
-            double cluster_mean_vy = cluster_vy_sum / static_cast<double>(count);
+        if (candidates.empty()) continue;
 
-            // 계산된 평균 속도를 클러스터 내 모든 셀에 일괄 덮어쓰기
+        // 4. [Consensus Step 2] 상호 검증 투표 (Voting)
+        // 후보들끼리 서로 비교하여 가장 많은 지지(가중치 합)를 받는 파티클을 선정합니다.
+        const Particle* best_consensus_particle = candidates[0];
+        double max_consensus_score = -1.0;
+
+        for (const auto* cand : candidates) {
+            double current_score = 0.0;
+            
+            for (const auto* voter : candidates) {
+                // [검증] yaml 파일의 설정값(0.3m/s, 5.0도)을 사용하여 유사도 판단
+                if (particle_filter_->checkSectorMatch(*cand, *voter, 
+                                                       particle_vector_vel_thresh_, 
+                                                       particle_vector_ang_thresh_)) 
+                {
+                    // 지지도는 상대방의 Weight만큼 합산 (신뢰도 기반 투표)
+                    current_score += voter->weight;
+                }
+            }
+
+            if (current_score > max_consensus_score) {
+                max_consensus_score = current_score;
+                best_consensus_particle = cand;
+            }
+        }
+
+        // 5. [Final Step] 리더 기준 최종 가중 평균 (Re-Gating)
+        // 선정된 '진짜 대장'을 기준으로 클러스터 내 모든 파티클을 다시 필터링합니다.
+        const Particle& winner = *best_consensus_particle;
+        double cluster_vx_sum = 0.0;
+        double cluster_vy_sum = 0.0;
+        double cluster_w_sum = 0.0;
+
+        for (int c_idx : cluster_indices) {
+            std::pair<int, int> range = cell_particle_ranges[c_idx];
+            if (range.first == -1) continue;
+
+            for (int p = range.first; p < range.second; ++p) {
+                // 리더와 방향이 맞는 파티클들만 최종 합산 (노이즈 제거)
+                // 여기서도 yaml 파일의 설정값을 사용합니다.
+                if (particle_filter_->checkSectorMatch(winner, parts[p], 
+                                                       particle_vector_vel_thresh_, 
+                                                       particle_vector_ang_thresh_)) 
+                {
+                    cluster_vx_sum += parts[p].vx * parts[p].weight;
+                    cluster_vy_sum += parts[p].vy * parts[p].weight;
+                    cluster_w_sum  += parts[p].weight;
+                }
+            }
+        }
+
+        // 6. 결과 적용
+        if (cluster_w_sum > 1e-9) {
+            double final_vx = cluster_vx_sum / cluster_w_sum;
+            double final_vy = cluster_vy_sum / cluster_w_sum;
+
+            // 계산된 "정제된 속도"를 클러스터 내 모든 셀에 일괄 적용
             for (int c_idx : cluster_indices) {
-                grid_[c_idx].mean_vx = cluster_mean_vx;
-                grid_[c_idx].mean_vy = cluster_mean_vy;
+                grid_[c_idx].mean_vx = final_vx;
+                grid_[c_idx].mean_vy = final_vy;
             }
         }
     }
 }
+
+// void DynamicGridMap::processDynamicClusters(const EgoCalibration& ego_calib) {
+//     auto& parts = particle_filter_->getParticles();
+    
+//     // 1. [Efficiency] 파티클 검색 최적화를 위한 맵핑 (Cell Index -> Particle Range)
+//     // 전체 파티클을 매번 탐색하면 연산량이 많으므로, 각 셀별 파티클 구간을 미리 저장
+//     std::vector<std::pair<int, int>> cell_particle_ranges(grid_.size(), {-1, -1});
+//     int current_cell = -1;
+//     int start_p = 0;
+    
+//     // parts 벡터는 grid_cell_idx 순으로 정렬되어 있다고 가정
+//     for (int i = 0; i <= static_cast<int>(parts.size()); ++i) {
+//         bool last = (i == static_cast<int>(parts.size()));
+//         int c_idx = last ? -1 : parts[i].grid_cell_idx;
+//         if (last || c_idx != current_cell) {
+//             if (current_cell >= 0 && current_cell < static_cast<int>(grid_.size())) {
+//                 cell_particle_ranges[current_cell] = {start_p, i};
+//             }
+//             current_cell = c_idx;
+//             start_p = i;
+//         }
+//     }
+
+//     // 2. BFS Clustering (2칸 반경으로 병합 - 두 발을 하나로 묶기 위함)
+//     std::vector<bool> visited(grid_.size(), false);
+    
+//     // [수정 포인트 1] 클러스터링 반경을 2칸(Chebyshev distance 2)으로 설정
+//     const int cluster_search_radius = 2; 
+
+//     for (int i = 0; i < grid_.size(); ++i) {
+//         // 이미 처리했거나 동적이 아닌 셀은 패스
+//         if (visited[i] || !grid_[i].is_dynamic) continue;
+        
+//         std::vector<int> cluster_indices;
+//         std::queue<int> q;
+//         q.push(i);
+//         visited[i] = true;
+        
+//         // --- BFS 탐색 시작 ---
+//         while (!q.empty()) {
+//             int curr = q.front(); q.pop();
+//             cluster_indices.push_back(curr);
+//             int gx, gy; indexToGrid(curr, gx, gy);
+            
+//             // 2칸 반경 이웃 탐색
+//             for (int dy = -cluster_search_radius; dy <= cluster_search_radius; ++dy) {
+//                 for (int dx = -cluster_search_radius; dx <= cluster_search_radius; ++dx) {
+//                     if (dx == 0 && dy == 0) continue;
+//                     int nx = gx + dx; int ny = gy + dy;
+//                     if (isInside(nx, ny)) {
+//                         int nidx = gridToIndex(nx, ny);
+//                         // 방문 안 했고, 동적 셀(is_dynamic)인 경우만 병합
+//                         if (!visited[nidx] && grid_[nidx].is_dynamic) {
+//                             visited[nidx] = true;
+//                             q.push(nidx);
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+        
+//         if (cluster_indices.empty()) continue;
+
+//         // 3. [수정 포인트 2] "Global Winner" 찾기 (클러스터 전체 파티클 대상)
+//         double global_max_weight = -1.0;
+//         int global_winner_idx = -1;
+
+//         // 클러스터에 속한 모든 셀을 뒤져서 최고 가중치 파티클을 찾음
+//         for (int c_idx : cluster_indices) {
+//             std::pair<int, int> range = cell_particle_ranges[c_idx];
+//             if (range.first == -1) continue; // 파티클 없는 셀은 패스
+
+//             for (int p = range.first; p < range.second; ++p) {
+//                 if (parts[p].weight > global_max_weight) {
+//                     global_max_weight = parts[p].weight;
+//                     global_winner_idx = p;
+//                 }
+//             }
+//         }
+
+//         // 유효한 파티클이 하나도 없으면 스킵
+//         if (global_winner_idx == -1) continue; 
+
+//         // 4. [수정 포인트 3] Global Winner 기준으로 가중 평균 (Re-Gating)
+//         const Particle& winner = parts[global_winner_idx];
+//         double cluster_vx_sum = 0.0;
+//         double cluster_vy_sum = 0.0;
+//         double cluster_w_sum = 0.0;
+
+//         for (int c_idx : cluster_indices) {
+//             std::pair<int, int> range = cell_particle_ranges[c_idx];
+//             if (range.first == -1) continue;
+
+//             for (int p = range.first; p < range.second; ++p) {
+//                 // 검증: 이 파티클이 Winner(대장)와 속도/방향이 비슷한가?
+//                 // 비슷하지 않다면(노이즈라면) 과감히 합산에서 제외됨 (Internal Noise Filtering 효과)
+//                 if (particle_filter_->checkSectorMatch(winner, parts[p], 
+//                                                        particle_vector_vel_thresh_, 
+//                                                        particle_vector_ang_thresh_)) 
+//                 {
+//                     cluster_vx_sum += parts[p].vx * parts[p].weight;
+//                     cluster_vy_sum += parts[p].vy * parts[p].weight;
+//                     cluster_w_sum  += parts[p].weight;
+//                 }
+//             }
+//         }
+
+//         // 5. 최종 결과 적용
+//         if (cluster_w_sum > 1e-9) {
+//             double final_vx = cluster_vx_sum / cluster_w_sum;
+//             double final_vy = cluster_vy_sum / cluster_w_sum;
+
+//             // 계산된 "정제된 속도"를 클러스터 내 모든 셀에 일괄 적용 (Object Consistency)
+//             for (int c_idx : cluster_indices) {
+//                 grid_[c_idx].mean_vx = final_vx;
+//                 grid_[c_idx].mean_vy = final_vy;
+//             }
+//         }
+//     }
+// }
 
 
 std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_stddev,
@@ -677,7 +769,7 @@ void DynamicGridMap::toOccupancyGridMsg(nav_msgs::OccupancyGrid& msg, const std:
         }
     }
 }
-
+#if !ONE_ARROW
 void DynamicGridMap::toMarkerArrayMsg(visualization_msgs::MarkerArray& arr,
                                       const std::string& frame_id,
                                       bool show_velocity_arrows,
@@ -730,6 +822,219 @@ void DynamicGridMap::toMarkerArrayMsg(visualization_msgs::MarkerArray& arr,
         }
     }
 }
+#endif
+
+#if ONE_ARROW
+void DynamicGridMap::toMarkerArrayMsg(visualization_msgs::MarkerArray& arr,
+                                      const std::string& frame_id,
+                                      bool show_velocity_arrows,
+                                      const EgoCalibration& ego_calib) const {
+    arr.markers.clear();
+    
+    // 1. 점유 그리드 (Cube List) 시각화 - 기존 로직 유지
+    visualization_msgs::Marker cubes;
+    cubes.header.stamp = ros::Time::now(); cubes.header.frame_id = frame_id; cubes.ns = "dogm_cells"; cubes.id = 0;
+    cubes.type = visualization_msgs::Marker::CUBE_LIST; cubes.action = visualization_msgs::Marker::ADD;
+    cubes.pose.orientation.w = 1.0; cubes.scale.x = resolution_; cubes.scale.y = resolution_; cubes.scale.z = 0.02;
+    cubes.lifetime = ros::Duration(1); 
+
+    for (int y = 0; y < grid_height_; ++y) {
+        for (int x = 0; x < grid_width_; ++x) {
+            const auto& c = grid_[gridToIndex(x, y)];
+            geometry_msgs::Point p; p.x = origin_x_ + (x + 0.5) * resolution_; p.y = origin_y_ + (y + 0.5) * resolution_; p.z = -0.02;
+            std_msgs::ColorRGBA col; col.a = 0.2;
+            double m_unk = std::max(0.0, 1.0 - c.m_occ - c.m_free);
+            if (c.m_occ >= c.m_free && c.m_occ >= m_unk) {
+                if (c.is_dynamic) { col.r = 1.0f; col.g = 0.0f; col.b = 0.0f; } 
+                else              { col.r = 0.0f; col.g = 0.0f; col.b = 1.0f; } 
+                col.a = 0.2 + 0.4 * std::min(1.0, c.m_occ); 
+            } else if (c.m_free >= m_unk) { col.r = col.g = col.b = 1.0f; col.a = 0.5f; } 
+            else { col.r = col.g = col.b = 0.5f; col.a = 0.5f; }
+            cubes.points.push_back(p); cubes.colors.push_back(col);
+        }
+    }
+    arr.markers.push_back(cubes);
+
+    // 2. 속도 벡터(Arrow) 시각화
+    if (show_velocity_arrows) {
+        visualization_msgs::Marker arrow_template;
+        arrow_template.header.stamp = ros::Time::now(); 
+        arrow_template.header.frame_id = frame_id; 
+        arrow_template.ns = "dogm_vel"; 
+        arrow_template.type = visualization_msgs::Marker::ARROW; 
+        arrow_template.action = visualization_msgs::Marker::ADD;
+        arrow_template.scale.x = 0.04; // Shaft diameter (ONE_ARROW=0과 동일)
+        arrow_template.scale.y = 0.06;  // Head diameter (ONE_ARROW=0과 동일)
+        arrow_template.scale.z = 0.06;  // Head length (ONE_ARROW=0과 동일)
+        arrow_template.color.r = 0.0; arrow_template.color.g = 1.0; arrow_template.color.b = 0.0; arrow_template.color.a = 1.0;
+        arrow_template.lifetime = ros::Duration(0.2);
+
+        int arrow_id = 10;
+        
+        // --- [Case A] Cluster Mode ON: 클러스터 중심에 하나만 그리기 + 바운딩 박스 표시 ---
+        if (cluster_mode_) {
+            std::vector<bool> visited(grid_.size(), false);
+            const int viz_cluster_radius = 2; // 시각화용 그룹핑 (로직과 동일하게 2칸)
+            #if BOUNDING_BOX
+            int bbox_id = 5000; // 바운딩 박스 마커 ID 시작점
+            #endif
+
+            for (int i = 0; i < grid_.size(); ++i) {
+                // 아직 방문 안 했고, 동적이며, 점유 확률이 높은 셀만 시작점으로
+                if (visited[i] || !grid_[i].is_dynamic || grid_[i].m_occ < 0.6) continue;
+
+                // BFS로 클러스터 묶기
+                std::vector<int> cluster_indices;
+                std::queue<int> q;
+                q.push(i);
+                visited[i] = true;
+
+                double sum_wx = 0.0;
+                double sum_wy = 0.0;
+                int count = 0;
+                
+                #if BOUNDING_BOX
+                // 바운딩 박스 계산용 변수
+                double min_wx = 1e9, max_wx = -1e9;
+                double min_wy = 1e9, max_wy = -1e9;
+                #endif
+
+                // 클러스터의 대표 속도 (모두 동일하게 설정되어 있으므로 첫 번째 것 사용)
+                double cluster_mean_vx = grid_[i].mean_vx;
+                double cluster_mean_vy = grid_[i].mean_vy;
+
+                while (!q.empty()) {
+                    int curr = q.front(); q.pop();
+                    cluster_indices.push_back(curr);
+                    
+                    // Centroid 계산을 위한 좌표 합산
+                    int cx, cy; indexToGrid(curr, cx, cy);
+                    double wx, wy; gridToWorld(cx, cy, wx, wy);
+                    sum_wx += wx;
+                    sum_wy += wy;
+                    count++;
+                    
+                    #if BOUNDING_BOX
+                    // 바운딩 박스 min/max 업데이트
+                    min_wx = std::min(min_wx, wx);
+                    max_wx = std::max(max_wx, wx);
+                    min_wy = std::min(min_wy, wy);
+                    max_wy = std::max(max_wy, wy);
+                    #endif
+
+                    for (int dy = -viz_cluster_radius; dy <= viz_cluster_radius; ++dy) {
+                        for (int dx = -viz_cluster_radius; dx <= viz_cluster_radius; ++dx) {
+                            if (dx == 0 && dy == 0) continue;
+                            int nx = cx + dx; int ny = cy + dy;
+                            if (isInside(nx, ny)) {
+                                int nidx = gridToIndex(nx, ny);
+                                // 동적이고 점유된 셀만 연결
+                                if (!visited[nidx] && grid_[nidx].is_dynamic && grid_[nidx].m_occ >= 0.6) {
+                                    visited[nidx] = true;
+                                    q.push(nidx);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 클러스터 하나 완성 -> 빨간색 원 + 화살표 생성
+                if (count > 0) {
+                    // 클러스터 중심 계산
+                    double centroid_x = sum_wx / count;
+                    double centroid_y = sum_wy / count;
+                    
+                    #if BOUNDING_BOX
+                    // 1. 클러스터 중심에 빨간색 원 표시
+                    visualization_msgs::Marker circle;
+                    circle.header.stamp = ros::Time::now();
+                    circle.header.frame_id = frame_id;
+                    circle.ns = "cluster_circle";
+                    circle.id = bbox_id++;
+                    circle.type = visualization_msgs::Marker::CYLINDER;
+                    circle.action = visualization_msgs::Marker::ADD;
+                    
+                    // 원의 중심 위치
+                    circle.pose.position.x = centroid_x;
+                    circle.pose.position.y = centroid_y;
+                    circle.pose.position.z = 0.01; // 바닥에 가깝게
+                    circle.pose.orientation.w = 1.0;
+                    
+                    // 클러스터 크기 계산 (바운딩 박스 대각선의 절반)
+                    double width = max_wx - min_wx + resolution_;
+                    double height = max_wy - min_wy + resolution_;
+                    double radius = std::sqrt(width * width + height * height) / 2.0;
+                    
+                    circle.scale.x = radius * 2.0; // 지름
+                    circle.scale.y = radius * 2.0; // 지름
+                    circle.scale.z = 0.02; // 원의 두께 (얇게)
+                    
+                    circle.color.r = 1.0;  // 빨간색
+                    circle.color.g = 0.0;
+                    circle.color.b = 0.0;
+                    circle.color.a = 0.3;  // 반투명
+                    circle.lifetime = ros::Duration(0.2);
+                    
+                    arr.markers.push_back(circle);
+                    #endif
+
+                    // 2. 클러스터 중심에 속도 화살표 생성 (빨간색 유지)
+                    geometry_msgs::Point p0, p1;
+                    p0.x = centroid_x; 
+                    p0.y = centroid_y; 
+                    p0.z = 0.02; // 빨간색 원(z=0.01) 위에 표시
+
+                    double abs_vx, abs_vy;
+                    ego_calib.getAbsoluteVelocity(cluster_mean_vx, cluster_mean_vy, abs_vx, abs_vy);
+                    
+                    // 속도 크기가 너무 작으면 화살표 생략 (깔끔한 시각화)
+                    double speed = std::sqrt(abs_vx*abs_vx + abs_vy*abs_vy);
+                    if (speed < 0.1) continue;
+
+                    const double scale = 0.4; // ONE_ARROW=0과 동일 (0.4)
+                    p1.x = p0.x + scale * abs_vx; 
+                    p1.y = p0.y + scale * abs_vy; 
+                    p1.z = 0.02; // 빨간색 원(z=0.01) 위에 표시
+
+                    visualization_msgs::Marker a = arrow_template;
+                    a.id = arrow_id++;
+                    a.points.push_back(p0); 
+                    a.points.push_back(p1);
+                    arr.markers.push_back(a);
+                }
+            }
+        } 
+        // --- [Case B] Cluster Mode OFF: 개별 셀마다 그리기 (기존 방식) ---
+        else {
+            for (int y = 0; y < grid_height_; ++y) {
+                for (int x = 0; x < grid_width_; ++x) {
+                    const auto& c = grid_[gridToIndex(x, y)];
+                    if (!c.is_dynamic || c.m_occ < 0.6) continue;
+
+                    geometry_msgs::Point p0, p1;
+                    p0.x = origin_x_ + (x + 0.5) * resolution_; 
+                    p0.y = origin_y_ + (y + 0.5) * resolution_; 
+                    p0.z = 0.0;
+
+                    double abs_vx, abs_vy;
+                    ego_calib.getAbsoluteVelocity(c.mean_vx, c.mean_vy, abs_vx, abs_vy);
+                    
+                    const double scale = 0.4;
+                    p1.x = p0.x + scale * abs_vx; 
+                    p1.y = p0.y + scale * abs_vy; 
+                    p1.z = 0.0;
+
+                    visualization_msgs::Marker a = arrow_template;
+                    a.id = arrow_id++;
+                    a.points.push_back(p0); 
+                    a.points.push_back(p1);
+                    arr.markers.push_back(a);
+                }
+            }
+        }
+    }
+}
+#endif
 
 void DynamicGridMap::shiftGrid(double dx, double dy) {
     int shift_x = static_cast<int>(std::round(dx / resolution_));
