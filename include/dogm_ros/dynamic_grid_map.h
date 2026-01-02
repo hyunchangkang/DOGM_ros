@@ -76,9 +76,11 @@ public:
     bool isInside(int gx, int gy) const;
 
     int getRadarHintSearchRadius() const { return radar_hint_search_radius_; }
+    void allParticlesToMarkerMsg(visualization_msgs::Marker& marker, const std::string& frame_id) const;
 
 private:
     void processDynamicClusters(const EgoCalibration& ego_calib);
+    void processDynamicClustersAvg(const EgoCalibration& ego_calib);
 
     double grid_size_;
     double resolution_;

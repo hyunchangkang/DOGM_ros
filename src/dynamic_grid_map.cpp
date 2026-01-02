@@ -368,10 +368,73 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
 
     // [New] Execute Cluster-based Processing if enabled
     if (cluster_mode_) {
-        processDynamicClusters(ego_calib);
+        processDynamicClustersAvg(ego_calib);
     }
 }
 
+void DynamicGridMap::processDynamicClustersAvg(const EgoCalibration& ego_calib) {
+    // Simple Average-based Clustering
+    // 클러스터 내 모든 셀의 속도를 단순 평균내서 적용
+    
+    std::vector<bool> visited(grid_.size(), false);
+    const int cluster_search_radius = 2;
+
+    for (int i = 0; i < grid_.size(); ++i) {
+        if (visited[i] || !grid_[i].is_dynamic) continue;
+        
+        std::vector<int> cluster_indices;
+        std::queue<int> q;
+        q.push(i);
+        visited[i] = true;
+        
+        // BFS 클러스터링
+        while (!q.empty()) {
+            int curr = q.front(); q.pop();
+            cluster_indices.push_back(curr);
+            int gx, gy; indexToGrid(curr, gx, gy);
+            
+            for (int dy = -cluster_search_radius; dy <= cluster_search_radius; ++dy) {
+                for (int dx = -cluster_search_radius; dx <= cluster_search_radius; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    int nx = gx + dx; int ny = gy + dy;
+                    if (isInside(nx, ny)) {
+                        int nidx = gridToIndex(nx, ny);
+                        if (!visited[nidx] && grid_[nidx].is_dynamic) {
+                            visited[nidx] = true;
+                            q.push(nidx);
+                        }
+                    }
+                }
+            }
+        }
+        
+        if (cluster_indices.empty()) continue;
+
+        // 클러스터 내 모든 셀의 속도 평균 계산
+        double avg_vx = 0.0;
+        double avg_vy = 0.0;
+        int count = 0;
+        
+        for (int c_idx : cluster_indices) {
+            avg_vx += grid_[c_idx].mean_vx;
+            avg_vy += grid_[c_idx].mean_vy;
+            count++;
+        }
+        
+        if (count > 0) {
+            avg_vx /= count;
+            avg_vy /= count;
+            
+            // 평균 속도를 클러스터 내 모든 셀에 적용
+            for (int c_idx : cluster_indices) {
+                grid_[c_idx].mean_vx = avg_vx;
+                grid_[c_idx].mean_vy = avg_vy;
+            }
+        }
+    }
+}
+
+#if 0
 void DynamicGridMap::processDynamicClusters(const EgoCalibration& ego_calib) {
     auto& parts = particle_filter_->getParticles();
     
@@ -523,6 +586,7 @@ void DynamicGridMap::processDynamicClusters(const EgoCalibration& ego_calib) {
         }
     }
 }
+#endif
 
 // void DynamicGridMap::processDynamicClusters(const EgoCalibration& ego_calib) {
 //     auto& parts = particle_filter_->getParticles();
@@ -676,6 +740,12 @@ std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_st
 
             // 탄생(Birth) 조건: 확률 질량(rho_b)이 충분하고 점유된 셀일 때
             if (cell.rho_b > 0.5 && cell.m_occ > 0.6) {
+                // [NEW] 이미 동적으로 추적 중인 셀이면 새 파티클 생성 안 함
+                // 이유: is_dynamic = true는 이미 파티클이 해당 영역을 추적 중이라는 의미
+                if (cell.is_dynamic) {
+                    continue;  // 건너뛰기
+                }
+                
                 int num_to_birth = static_cast<int>(std::ceil(cell.rho_b * 4.0));
                 
                 // [Radar Hint 로직] - 여기서는 동적 파티클 비율 계산에만 사용 (기존 유지)
@@ -866,8 +936,8 @@ void DynamicGridMap::toMarkerArrayMsg(visualization_msgs::MarkerArray& arr,
         arrow_template.scale.x = 0.04; // Shaft diameter (ONE_ARROW=0과 동일)
         arrow_template.scale.y = 0.06;  // Head diameter (ONE_ARROW=0과 동일)
         arrow_template.scale.z = 0.06;  // Head length (ONE_ARROW=0과 동일)
-        arrow_template.color.r = 0.0; arrow_template.color.g = 1.0; arrow_template.color.b = 0.0; arrow_template.color.a = 1.0;
-        arrow_template.lifetime = ros::Duration(0.2);
+        arrow_template.color.r = 1.0; arrow_template.color.g = 1.0; arrow_template.color.b = 0.0; arrow_template.color.a = 1.0;
+        arrow_template.lifetime = ros::Duration(0.4);
 
         int arrow_id = 10;
         
@@ -982,7 +1052,7 @@ void DynamicGridMap::toMarkerArrayMsg(visualization_msgs::MarkerArray& arr,
                     geometry_msgs::Point p0, p1;
                     p0.x = centroid_x; 
                     p0.y = centroid_y; 
-                    p0.z = 0.02; // 빨간색 원(z=0.01) 위에 표시
+                    p0.z = 0.01; // 빨간색 원(z=0.01) 위에 표시
 
                     double abs_vx, abs_vy;
                     ego_calib.getAbsoluteVelocity(cluster_mean_vx, cluster_mean_vy, abs_vx, abs_vy);
@@ -991,7 +1061,7 @@ void DynamicGridMap::toMarkerArrayMsg(visualization_msgs::MarkerArray& arr,
                     double speed = std::sqrt(abs_vx*abs_vx + abs_vy*abs_vy);
                     if (speed < 0.1) continue;
 
-                    const double scale = 0.4; // ONE_ARROW=0과 동일 (0.4)
+                    const double scale = 0.8; // ONE_ARROW=0과 동일 (0.4)
                     p1.x = p0.x + scale * abs_vx; 
                     p1.y = p0.y + scale * abs_vy; 
                     p1.z = 0.02; // 빨간색 원(z=0.01) 위에 표시
@@ -1035,6 +1105,77 @@ void DynamicGridMap::toMarkerArrayMsg(visualization_msgs::MarkerArray& arr,
     }
 }
 #endif
+
+void DynamicGridMap::allParticlesToMarkerMsg(visualization_msgs::Marker& marker, const std::string& frame_id) const {
+    marker.header.stamp = ros::Time::now();
+    marker.header.frame_id = frame_id;
+    marker.ns = "all_particles";
+    marker.id = 0;
+    marker.type = visualization_msgs::Marker::LINE_LIST;
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.pose.orientation.w = 1.0;
+
+    // 화살표 선 두께 (0.005m = 5mm)
+    marker.scale.x = 0.005; 
+
+    // 초록색 설정 (요청사항)
+    marker.color.r = 0.0f;
+    marker.color.g = 1.0f;
+    marker.color.b = 0.0f;
+    marker.color.a = 0.6f;
+
+    marker.lifetime = ros::Duration(0.1);
+
+    const auto& particles = particle_filter_->getParticles();
+    const double shaft_scale = 0.15; // 몸통 길이 배율
+    const double head_len = 0.04;    // 화살표 머리 날개 길이
+    const double cos30 = 0.866, sin30 = 0.5; // 30도 회전용 상수
+
+    // 화살표 하나당 3개의 선(점 6개)이 필요함
+    marker.points.reserve(particles.size() * 6);
+
+    for (const auto& p : particles) {
+        double vx = p.vx;
+        double vy = p.vy;
+        double speed = std::sqrt(vx * vx + vy * vy);
+
+        // 1. 몸통 (Shaft) 시작점과 끝점 계산
+        geometry_msgs::Point p_start, p_end;
+        p_start.x = p.x;
+        p_start.y = p.y;
+        p_start.z = 0.1; // 격자 위로 약간 띄움
+
+        p_end.x = p.x + vx * shaft_scale;
+        p_end.y = p.y + vy * shaft_scale;
+        p_end.z = 0.1;
+        
+        marker.points.push_back(p_start);
+        marker.points.push_back(p_end);
+
+        // 속도가 너무 작으면 머리는 그리지 않음
+        if (speed > 0.1) {
+            // 역방향 단위 벡터 계산
+            double ux = -vx / speed * head_len;
+            double uy = -vy / speed * head_len;
+
+            // 2. 머리 날개 1 (Left Wing)
+            geometry_msgs::Point h1;
+            h1.x = p_end.x + (ux * cos30 - uy * sin30);
+            h1.y = p_end.y + (ux * sin30 + uy * cos30);
+            h1.z = 0.1;
+            marker.points.push_back(p_end);
+            marker.points.push_back(h1);
+
+            // 3. 머리 날개 2 (Right Wing)
+            geometry_msgs::Point h2;
+            h2.x = p_end.x + (ux * cos30 + uy * sin30);
+            h2.y = p_end.y + (-ux * sin30 + uy * cos30);
+            h2.z = 0.1;
+            marker.points.push_back(p_end);
+            marker.points.push_back(h2);
+        }
+    }
+}
 
 void DynamicGridMap::shiftGrid(double dx, double dy) {
     int shift_x = static_cast<int>(std::round(dx / resolution_));

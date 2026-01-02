@@ -24,6 +24,9 @@
 #include "dogm_ros/structures.h"
 #include "dogm_ros/ego_calibration.h"
 
+/**
+ * @brief Main ROS Node for DOGM (Dynamic Occupancy Grid Map) processing
+ */
 class DogmNode
 {
 public:
@@ -31,7 +34,7 @@ public:
     {
         loadParams();
         
-        // [Modified] Passing separated thresholds to constructor
+        // Initialize DynamicGridMap with loaded parameters
         grid_map_ = std::make_unique<DynamicGridMap>(
             grid_size_, grid_res_, num_particles_,
             process_noise_pos_, process_noise_vel_,
@@ -40,14 +43,20 @@ public:
             use_fsd_, fsd_T_static_, fsd_T_free_,
             use_mc_, use_radar_,
             lidar_hit_point_, lidar_noise_stddev_,
-            particle_vector_vel_thresh_, // [New]
-            particle_vector_ang_thresh_, // [New]
+            particle_vector_vel_thresh_,
+            particle_vector_ang_thresh_,
             particle_static_vel_thresh_, radar_static_vel_thresh_,
             cluster_mode_ 
         );
         
+        // Setup Publishers
         grid_pub_   = nh_.advertise<nav_msgs::OccupancyGrid>(grid_topic_, 1);
         marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>(marker_topic_, 1);
+        
+        // [Added] Publisher for all particles visualization for monitoring convergence
+        all_particle_pub_ = nh_.advertise<visualization_msgs::Marker>(all_particle_marker_topic_, 1);
+
+        // Setup Subscribers
         scan_sub_ = nh_.subscribe<sensor_msgs::LaserScan>(lidar_topic_, 1, &DogmNode::scanCb, this);
 
         if (use_radar_) {
@@ -67,16 +76,25 @@ public:
     }
 
 private:
+    /**
+     * @brief Lidar scan data callback
+     */
     void scanCb(const sensor_msgs::LaserScan::ConstPtr& msg) {
         last_scan_ = msg;
         has_scan_  = true;
     }
 
+    /**
+     * @brief Odometry data callback for ego-motion compensation
+     */
     void odomCb(const nav_msgs::Odometry::ConstPtr& msg) {
         if (!msg) return;
         ego_calib_.update(msg->twist.twist.linear.x, msg->twist.twist.linear.y);
     }
 
+    /**
+     * @brief Radar 1 (Right) data callback
+     */
     void radar1Cb(const sensor_msgs::PointCloud2::ConstPtr& msg) {
         if (!use_radar_) return;
         last_radar_cloud_1_.reset(new pcl::PointCloud<mmWaveCloudType>());
@@ -84,6 +102,9 @@ private:
         has_radar_1_ = !last_radar_cloud_1_->points.empty();
     }
 
+    /**
+     * @brief Radar 2 (Left) data callback
+     */
     void radar2Cb(const sensor_msgs::PointCloud2::ConstPtr& msg) {
         if (!use_radar_) return;
         last_radar_cloud_2_.reset(new pcl::PointCloud<mmWaveCloudType>());
@@ -91,6 +112,9 @@ private:
         has_radar_2_ = !last_radar_cloud_2_->points.empty();
     }
 
+    /**
+     * @brief Processes radar cloud and transforms it to the target frame
+     */
     bool processRadarData(const pcl::PointCloud<mmWaveCloudType>::Ptr& cloud, 
                           const std::string& target_frame, 
                           const std::string& sensor_frame,
@@ -103,7 +127,7 @@ private:
             packet.sensor_x = transform.transform.translation.x;
             packet.sensor_y = transform.transform.translation.y;
             
-            // Extract sensor orientation (yaw angle from quaternion)
+            // Extract sensor orientation (yaw) from quaternion
             tf2::Quaternion q(
                 transform.transform.rotation.x,
                 transform.transform.rotation.y,
@@ -129,6 +153,9 @@ private:
         }
     }
 
+    /**
+     * @brief Main filter update loop triggered by timer
+     */
     void updateLoop(const ros::TimerEvent&) {
         if (!has_scan_) return;
         ros::Time now = ros::Time::now();
@@ -136,10 +163,12 @@ private:
         if (dt <= 0.0) return;
         last_update_time_ = now;
 
+        // 1. Shift grid based on robot movement
         double dx, dy; int sx, sy;
         ego_calib_.getGridShift(dt, grid_res_, sx, sy, dx, dy);
         grid_map_->shiftGrid(dx, dy);
 
+        // 2. Prepare radar data packets
         std::vector<RadarDataPacket> radar_packets;
         if (use_radar_) {
             RadarDataPacket p1, p2;
@@ -151,11 +180,13 @@ private:
             }
         }
         
+        // 3. Generate measurement grid from Lidar/Radar sensors
         grid_map_->generateMeasurementGrid(last_scan_, radar_packets);
         
         has_radar_1_ = false; 
         has_radar_2_ = false;
 
+        // 4. Compensation for ego-acceleration
         double curr_vx = ego_calib_.getVx();
         double curr_vy = ego_calib_.getVy();
         double d_vx = curr_vx - last_ego_vx_;
@@ -164,16 +195,20 @@ private:
         last_ego_vy_ = curr_vy;
 
         auto& pf = grid_map_->getParticleFilter();
+        
+        // 5. Particle Filter step: Predict next state
         pf.predict(dt, persistence_prob_, velocity_damping_threshold_, 
                    velocity_damping_factor_, max_velocity_, d_vx, d_vy);
 
+        // 6. Particle Filter step: Update weights based on measurements
         pf.sortParticlesByGridCell(*grid_map_);
         pf.updateWeights(grid_map_->getMeasurementGrid(), grid_map_->getGrid(), *grid_map_, radar_noise_stddev_);
         
+        // 7. Update occupancy probability and velocity statistics
         grid_map_->updateOccupancy(birth_prob_);
-        
         grid_map_->calculateVelocityStatistics(max_vel_for_scaling_, use_ego_comp_, ego_calib_);
         
+        // 8. Generate new particles at birth cells and perform Resampling
         auto new_borns = grid_map_->generateNewParticles(
             newborn_vel_stddev_, min_dynamic_birth_ratio_, max_dynamic_birth_ratio_,
             max_radar_speed_for_scaling_, dynamic_newborn_vel_stddev_, ego_calib_
@@ -181,6 +216,12 @@ private:
         
         pf.resample(new_borns);
 
+        // [Added] Publish all raw particles to RViz for monitoring
+        visualization_msgs::Marker all_p_marker;
+        grid_map_->allParticlesToMarkerMsg(all_p_marker, base_frame_);
+        all_particle_pub_.publish(all_p_marker);
+
+        // 9. Publish resulting maps and markers
         nav_msgs::OccupancyGrid grid_msg;
         grid_map_->toOccupancyGridMsg(grid_msg, base_frame_);
         grid_pub_.publish(grid_msg);
@@ -192,7 +233,13 @@ private:
         has_scan_ = false;
     }
 
+    /**
+     * @brief Load filter and node parameters from ROS parameter server
+     */
     void loadParams() {
+        // [Added] Topic name for all particles visualization
+        pnh_.param("all_particle_marker_topic", all_particle_marker_topic_, std::string("/dogm/all_particles"));
+
         pnh_.param("use_radar", use_radar_, true);
         pnh_.param("lidar_topic", lidar_topic_, std::string("/scan"));
         pnh_.param("radar_topic_1", radar_topic_1_, std::string("/ti_mmwave/radar_scan_pcl_0"));
@@ -219,7 +266,6 @@ private:
         pnh_.param("particle_static_velocity_threshold", particle_static_vel_thresh_, 0.3);
         pnh_.param("radar_static_velocity_threshold", radar_static_vel_thresh_, 0.5);
         
-        // [Modified] New Thresholds for Sector Gating
         pnh_.param("particle_vector_Velthresh", particle_vector_vel_thresh_, 0.3); 
         pnh_.param("particle_vector_Angthresh", particle_vector_ang_thresh_, 30.0);
 
@@ -246,11 +292,14 @@ private:
         pnh_.param("cluster_mode", cluster_mode_, false);
     }
 
+    // ROS related members
     ros::NodeHandle nh_, pnh_;
     ros::Subscriber scan_sub_, odom_sub_;
     ros::Subscriber radar_sub_1_, radar_sub_2_;
     ros::Publisher  grid_pub_, marker_pub_, ego_vel_pub_;
+    ros::Publisher  all_particle_pub_; // [Added]
     ros::Timer      timer_;
+    
     std::unique_ptr<DynamicGridMap> grid_map_;
     EgoCalibration ego_calib_;
     
@@ -265,6 +314,7 @@ private:
     std::string lidar_topic_, grid_topic_, marker_topic_, base_frame_, odom_topic_;
     std::string radar_topic_1_, radar_topic_2_;
     std::string radar_frame_1_, radar_frame_2_;
+    std::string all_particle_marker_topic_; // [Added]
 
     double grid_size_, grid_res_, filter_hz_, persistence_prob_, birth_prob_;
     int num_particles_;
@@ -275,7 +325,6 @@ private:
     double velocity_damping_threshold_, velocity_damping_factor_;
     double max_vel_for_scaling_;
     
-    // [Modified] Replaced old thresh with new ones
     double particle_vector_vel_thresh_;
     double particle_vector_ang_thresh_;
 
@@ -293,6 +342,7 @@ private:
     
     bool cluster_mode_;
 
+    // Cache for sensor data
     sensor_msgs::LaserScan::ConstPtr last_scan_;
     pcl::PointCloud<mmWaveCloudType>::Ptr last_radar_cloud_1_;
     pcl::PointCloud<mmWaveCloudType>::Ptr last_radar_cloud_2_;
@@ -300,6 +350,9 @@ private:
     ros::Time last_update_time_;
 };
 
+/**
+ * @brief Node entry point
+ */
 int main(int argc, char** argv) {
     ros::init(argc, argv, "dogm_node");
     DogmNode node;
