@@ -67,6 +67,14 @@ void ParticleFilter::predict(double dt, double survival_prob,
 
         p.weight *= survival_prob;
         p.age++;
+        
+        // [NEW] Gradually increase confidence as particle survives
+        // Confidence saturates at 1.0 after ~10 frames
+        if (p.weight > 1e-9) { // Only increase if particle is alive
+            p.confidence = std::min(1.0, p.confidence + 0.1);
+        } else {
+            p.confidence *= 0.5; // Decay confidence for dying particles
+        }
     }
 }
 

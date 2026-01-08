@@ -234,8 +234,8 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
 {
     // 1. Initialization
     for (auto& cell : grid_) {
-        cell.is_dynamic = false; 
-        cell.dyn_streak = 0; cell.stat_streak = 0;
+        // cell.is_dynamic = false; 
+        // cell.dyn_streak = 0; cell.stat_streak = 0;
         cell.dynamic_score *= 0.85; 
         if (cell.dynamic_score < 0.01) cell.dynamic_score = 0.0;
         if (cell.m_free > 0.8) cell.free_streak = std::min<std::uint8_t>(255, cell.free_streak + 1);
@@ -259,11 +259,26 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
         // 1. Find Winner in Cell
         double max_weight = -1.0;
         int winner_idx = start;
+        double max_confidence = 0.0; // Track winner's confidence
         for (int j = start; j < end; ++j) {
             if (parts[j].weight > max_weight) {
                 max_weight = parts[j].weight;
                 winner_idx = j;
+                max_confidence = parts[j].confidence;
             }
+        }
+        
+        // [NEW] Low-confidence winner → Skip dynamic judgment
+        // This prevents immature particles from causing false dynamics
+        const double MIN_CONFIDENCE_FOR_DYNAMIC = 0.5;
+        if (max_confidence < MIN_CONFIDENCE_FOR_DYNAMIC) {
+            // Treat as static until confidence builds up
+            c.stat_streak = std::min<std::uint8_t>(255, c.stat_streak + 1);
+            if (c.stat_streak >= need_off_frames) {
+                c.is_dynamic = false;
+            }
+            c.dyn_streak = 0;
+            return;
         }
         
         // 2. Sector Gating (Vel 0.1, Ang 60.0)
@@ -791,6 +806,13 @@ std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_st
                     p.vy = static_vel_dist_y(random_generator_);
                     p.weight = cell.rho_b / static_cast<double>(num_to_birth);
                     p.grid_cell_idx = idx; p.age = 0;
+                    // [NEW] Initial confidence based on occupancy stability
+                    p.vx = static_vel_dist_x(random_generator_);
+                    p.vy = static_vel_dist_y(random_generator_);
+                    p.weight = cell.rho_b / static_cast<double>(num_to_birth);
+                    p.grid_cell_idx = idx; p.age = 0;
+                    // [NEW] Initial confidence based on occupancy stability
+                    p.confidence = cell.occ_stability;
                     new_particles.push_back(p);
                 }
 
@@ -809,6 +831,8 @@ std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_st
                     
                     p.weight = cell.rho_b / static_cast<double>(num_to_birth);
                     p.grid_cell_idx = idx; p.age = 0;
+                    // [NEW] Dynamic particles start with lower confidence
+                    p.confidence = cell.occ_stability * 0.5;
                     new_particles.push_back(p);
                 }
             }
