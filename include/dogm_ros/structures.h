@@ -83,6 +83,8 @@ struct GridCell {
     double rho_b{0.0};
     double rho_p{0.0};
 
+    float total_particle_weight{0.0f};
+
     double mean_vx{0.0}, mean_vy{0.0};
     double var_vx{0.0},  var_vy{0.0}, covar_vxy{0.0};
 

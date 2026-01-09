@@ -1,0 +1,377 @@
+DOGM 동적 그리드맵 알고리즘 - 전체 파이프라인 순서도
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[전체 흐름 개요]
+
+1. updateOccupancy()         → 점유 확률 및 탄생 확률(rho_b) 계산
+2. generateNewParticles()    → 새로운 파티클 생성 (레이다 기반 비율 결정)
+3. ParticleFilter::predict() → 파티클 이동 예측 (프로세스 노이즈)
+4. ParticleFilter::update()  → 라이다 측정치로 파티클 가중치 업데이트
+5. calculateVelocityStatistics() → 파티클 기반 속도 계산 및 is_dynamic 상태 전환
+6. ParticleFilter::resample() → 낮은 가중치 파티클 제거, 높은 가중치 파티클 복제
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+════════════════════════════════════════════════════════════════════════════════════════════════
+■ 함수 1: generateNewParticles() - 파티클 탄생 로직
+════════════════════════════════════════════════════════════════════════════════════════════════
+
+[목적] 
+  - 새로운 물체가 나타났을 때 파티클을 생성
+  - 레이다 속도 기반으로 정적/동적 파티클 비율 결정
+  - 좀비 셀(파티클 소멸) 빠른 복구
+
+[입력]
+  - max_dynamic_birth_ratio: 0.9 (레이다가 움직임 감지 시 동적 파티클 비율)
+  - max_static_birth_ratio:  0.95 (레이다가 정지 감지 시 정적 파티클 비율)
+  - radar_static_vel_thresh_: 0.2 m/s (레이다 속도 임계값)
+
+[출력]
+  - new_particles: 생성된 파티클 벡터
+
+────────────────────────────────────────────────────────────────────────────────────────────────
+
+시작: 모든 셀(x, y) 순회
+  │
+  ├─[1단계] 진입 게이트 (Entry Gate)
+  │   조건: rho_b > 0.5 && m_occ > 0.6
+  │   의미: "새로운 물체가 탄생할 가능성이 있는 셀인가?"
+  │
+  │   NO  → continue (다음 셀로)
+  │   YES ↓
+  │
+  ├─[2단계] 좀비 셀 체크 (Zombie Cell Detection)
+  │   조건: is_dynamic=true && total_particle_weight < 0.05
+  │   의미: "동적 상태인데 파티클이 사라진 비정상 상태인가?"
+  │   
+  │   [좀비 셀이란?]
+  │   - 빠르게 움직이는 물체의 파티클이 인접 셀로 이동
+  │   - 원래 셀은 is_dynamic=true이지만 파티클은 없는 상태
+  │   - 2프레임 내 자연 소멸되지만, 그 전에 발견하면 즉시 복구
+  │
+  │   YES → [좀비 복구 모드]
+  │   │     1. dyn_streak 강제 유지 (≥2)
+  │   │     2. 이웃/레이다 체크 생략 (즉시 [6단계]로)
+  │   │     3. num_to_birth = max(8, ...)  (많은 파티클로 빠른 복구)
+  │   │     4. 이전 속도 복원 시도 (cell.mean_vx/vy)
+  │   │     → [6단계: 파티클 개수 결정]으로 점프
+  │   │
+  │   NO  ↓
+  │
+  ├─[3단계] 파티클 충분 여부 (Particle Sufficiency Check)
+  │   조건: total_particle_weight > 0.05
+  │   의미: "이미 파티클이 충분한가?"
+  │
+  │   YES → continue (생성 불필요, 다음 셀로)
+  │   NO  ↓
+  │
+  ├─[4단계] 레이다 속도 확인 (Radar Velocity Check) ★★★ 먼저 체크!
+  │   목적: "동적 파티클과 정적 파티클의 비율 결정"
+  │   
+  │   과정:
+  │   1. radar_hint_search_radius 반경 내 레이다 데이터 탐색
+  │   2. 최대 radial velocity 계산 (ego-motion 보정)
+  │   3. max_radar_speed > radar_static_vel_thresh? (예: 0.2 m/s)
+  │
+  │   결과:
+  │   ├─ radar_active = true  (레이다가 움직임 감지)
+  │   └─ radar_active = false (레이다가 정지 감지)
+  │
+  ↓
+  ├─[5단계] 벽 필터링 (Wall Filtering) ★★★ 레이다 체크 후 수행!
+  │   목적: "정적인 벽에 계속 파티클을 뿌리는 낭비 방지"
+  │   
+  │   [핵심 로직]
+  │   if (radar_active) {
+  │       → 벽 체크 건너뛰고 무조건 생성! (새로운 사람 감지)
+  │   } else {
+  │       → 벽 필터링 수행:
+  │         조건 A: is_dynamic=true?
+  │           YES → [6단계]로 (동적 셀은 생성 자격 있음)
+  │         
+  │         조건 B: 동적 이웃 있음? (2칸 반경)
+  │           검사: is_dynamic=true && weight>0.05인 이웃
+  │           YES → [6단계]로 (확산 가능)
+  │           NO  → continue (정적 벽 확정, 생성 차단!)
+  │   }
+  │
+  │   [의미]
+  │   - 레이다가 감지한 경우 = 새로운 동적 물체 → 무조건 생성
+  │   - 레이다 없고 정적 & 이웃 없음 = 진짜 벽 → 생성 차단
+  │   - 레이다 없지만 동적 or 이웃 있음 = 일시적 정지 → 생성 허용
+  │
+  ↓
+  ├─[6단계] 파티클 개수 결정 (Birth Count Calculation)
+  │   
+  │   기본: num_to_birth = ceil(rho_b * 4.0)
+  │   
+  │   조정:
+  │   ├─ 좀비 셀인가?     → num_to_birth = max(8, ...)  (빠른 복구)
+  │   └─ 일반 셀인가?     → num_to_birth = max(5, ...)  (최소 보장)
+  │
+  ↓
+  ├─[7단계] 정적/동적 비율 결정 (Static/Dynamic Ratio)
+  │   
+  │   ┌─ Case 1: 좀비 셀 복구
+  │   │   → num_dynamic = num_to_birth * max_dynamic_birth_ratio (90%)
+  │   │   → num_static  = 나머지 (10%)
+  │   │   (좀비 셀은 원래 is_dynamic=true였으므로 동적 위주)
+  │   │
+  │   ├─ Case 2: radar_active = true (레이다가 움직임 감지)
+  │   │   → num_dynamic = num_to_birth * max_dynamic_birth_ratio (90%)
+  │   │   → num_static  = 나머지 (10%)
+  │   │   (레이다가 움직임을 보면 동적 파티클 위주)
+  │   │
+  │   └─ Case 3: radar_active = false (레이다가 정지 감지)
+  │       → num_static  = num_to_birth * max_static_birth_ratio (95%)
+  │       → num_dynamic = 나머지 (5%)
+  │       (레이다가 정지를 보면 정적 파티클 위주)
+  │
+  ↓
+  └─[8단계] 파티클 생성 (Particle Spawn)
+      
+      1. 정적 파티클 생성 (num_static개)
+         ├─ 위치: 셀 중심 + 랜덤 노이즈
+         ├─ 속도: ego-motion 속도 + 미세 노이즈 (0.05)
+         │        (로봇이 움직이면 정적 물체는 반대 방향으로 보임)
+         └─ 가중치: rho_b / num_to_birth
+      
+      2. 동적 파티클 생성 (num_dynamic개)
+         ├─ 위치: 셀 중심 + 랜덤 노이즈
+         │
+         ├─ 속도 결정:
+         │   ├─ 좀비 셀이고 이전 속도 있음 (>0.1 m/s)?
+         │   │   → 이전 속도 복원 + 노이즈
+         │   │   (빠르게 움직이던 물체의 속도 연속성 유지)
+         │   │
+         │   └─ 그 외 (일반 탄생):
+         │       ├─ radar_active=true?
+         │       │   → 랜덤 방향 * max_radar_speed + 노이즈
+         │       │   (레이다가 본 속도로 초기화)
+         │       └─ radar_active=false?
+         │           → 랜덤 방향 * 1.0 m/s + 노이즈
+         │           (탐색용 랜덤 속도)
+         │
+         └─ 가중치: rho_b / num_to_birth
+
+
+════════════════════════════════════════════════════════════════════════════════════════════════
+■ 함수 2: calculateVelocityStatistics() - 속도 계산 및 동적/정적 상태 전환
+════════════════════════════════════════════════════════════════════════════════════════════════
+
+[목적]
+  - 파티클들의 속도를 통계적으로 계산 (Winner Mode 방식)
+  - is_dynamic 상태 전환 (히스테리시스 적용)
+  - 파티클이 없어도 레이다 기반으로 상태 전환 가능
+
+[입력]
+  - particle_static_vel_thresh_: 0.2 m/s (파티클 속도 임계값)
+  - radar_static_vel_thresh_: 0.2 m/s (레이다 속도 임계값)
+  - need_on_frames: 2 (정적→동적 전환에 필요한 프레임 수)
+  - need_off_frames: 2 (동적→정적 전환에 필요한 프레임 수) ← 1로 변경 권장
+
+[출력]
+  - cell.is_dynamic: 동적/정적 상태
+  - cell.mean_vx, cell.mean_vy: 셀의 평균 속도
+  - cell.total_particle_weight: 파티클 가중치 합
+
+────────────────────────────────────────────────────────────────────────────────────────────────
+
+시작: 모든 파티클을 셀별로 그룹핑하여 처리 (flush_cell 람다 함수)
+  │
+  ├─[초기화]
+  │   - total_particle_weight = 0.0 (모든 셀)
+  │   - dynamic_score *= 0.85 (감쇠)
+  │
+  ↓
+  ├─[Case 1] 파티클이 없는 셀 (end-start ≤ 2 || weight < 1e-6)
+  │   
+  │   [상황] 
+  │   - 파티클이 소멸했거나 다른 셀로 이동
+  │   - 기존에는 여기서 상태 변경 불가능 → 문제!
+  │   
+  │   [FIX] 레이다 기반 상태 전환 추가!
+  │   
+  │   1. 레이다 속도 확인 (radar_hint_search_radius 반경)
+  │      - max_comp_speed 계산 (ego-motion 보정)
+  │      - has_speed_from_radar = (max_comp_speed > radar_static_vel_thresh_)
+  │   
+  │   2. Streak 업데이트
+  │      if (is_occupied && has_speed_from_radar) {
+  │          dyn_streak += 2;  // 레이다가 움직임 감지
+  │          stat_streak = 0;
+  │      } else {
+  │          stat_streak += 1;  // 레이다가 정지 감지
+  │          dyn_streak = 0;
+  │      }
+  │   
+  │   3. 상태 전환
+  │      if (!is_dynamic && dyn_streak >= 2) {
+  │          is_dynamic = true;  // 정적→동적 전환!
+  │      }
+  │      if (is_dynamic && stat_streak >= 2) {
+  │          is_dynamic = false; // 동적→정적 전환
+  │      }
+  │   
+  │   [의미]
+  │   - 파티클 없어도 레이다가 움직임을 보면 동적으로 전환!
+  │   - "멈춘 사람이 다시 움직이면" 복구 가능
+  │
+  ↓
+  ├─[Case 2] 파티클이 있는 셀 (정상 처리)
+  │   
+  │   ┌─[Step 1] Winner Mode 속도 계산
+  │   │   
+  │   │   1. 셀 내에서 가장 가중치 높은 파티클 찾기 (Winner)
+  │   │      winner_idx = argmax(weight)
+  │   │   
+  │   │   2. Sector Gating (Winner와 비슷한 파티클만 선별)
+  │   │      조건:
+  │   │      - 속도 차이 < particle_vector_vel_thresh_ (예: 0.3 m/s)
+  │   │      - 각도 차이 < particle_vector_ang_thresh_ (예: 5.0도)
+  │   │      
+  │   │      if (조건 만족) {
+  │   │          mode_vx_sum += vx * weight;
+  │   │          mode_vy_sum += vy * weight;
+  │   │          mode_w_sum  += weight;
+  │   │      }
+  │   │   
+  │   │   3. 가중 평균 계산
+  │   │      cell.mean_vx = mode_vx_sum / mode_w_sum;
+  │   │      cell.mean_vy = mode_vy_sum / mode_w_sum;
+  │   │   
+  │   │   [의미]
+  │   │   - 노이즈 파티클 제거 (Winner와 비슷한 것만)
+  │   │   - 다수결 방식으로 안정적인 속도 추정
+  │   │
+  │   ↓
+  │   ├─[Step 2] 파티클 속도 판단
+  │   │   
+  │   │   speed_p = sqrt(mean_vx² + mean_vy²)
+  │   │   if (use_ego_comp) {
+  │   │       speed_p = getAbsoluteSpeed(...)  // ego-motion 보정
+  │   │   }
+  │   │   
+  │   │   has_speed_from_particles = (speed_p > particle_static_vel_thresh_)
+  │   │
+  │   ↓
+  │   ├─[Step 3] 레이다 속도 확인
+  │   │   
+  │   │   1. radar_hint_search_radius 반경 내 레이다 데이터 탐색
+  │   │   2. max_comp_speed 계산 (ego-motion 보정)
+  │   │   3. has_speed_from_radar = (max_comp_speed > radar_static_vel_thresh_)
+  │   │
+  │   ↓
+  │   ├─[Step 4] 동적 후보 판정
+  │   │   
+  │   │   dyn_candidate = is_occupied && 
+  │   │                   (has_speed_from_particles || has_speed_from_radar)
+  │   │   
+  │   │   [FSD: False Static Detection 보정]
+  │   │   - 파티클도 레이다도 정지인데, 오래 정지 + 자주 비어있음
+  │   │   - → 실제로는 움직이는 물체일 가능성 (보정)
+  │   │   
+  │   │   if (use_fsd_ && is_currently_static && 
+  │   │       stat_streak >= fsd_T_static_ && 
+  │   │       free_streak >= fsd_T_free_) {
+  │   │       dyn_candidate = true;
+  │   │   }
+  │   │
+  │   ↓
+  │   ├─[Step 5] Streak 업데이트
+  │   │   
+  │   │   if (dyn_candidate) {
+  │   │       dyn_streak += (has_speed_from_radar) ? 2 : 1;
+  │   │       stat_streak = 0;
+  │   │   } else {
+  │   │       stat_streak += 1;
+  │   │       dyn_streak = 0;
+  │   │   }
+  │   │
+  │   ↓
+  │   ├─[Step 6] 상태 전환 (히스테리시스)
+  │   │   
+  │   │   // 정적 → 동적 (need_on_frames = 2)
+  │   │   if (!is_dynamic && dyn_streak >= 2) {
+  │   │       is_dynamic = true;
+  │   │   }
+  │   │   
+  │   │   // 동적 → 정적 (need_off_frames = 2)
+  │   │   if (is_dynamic && stat_streak >= 2) {
+  │   │       is_dynamic = false;
+  │   │   }
+  │   │   
+  │   │   [히스테리시스 의미]
+  │   │   - 잡음에 의한 깜빡임 방지
+  │   │   - 2프레임 연속 조건 만족해야 전환
+  │   │   - need_off_frames를 1로 줄이면 정적 전환 빨라짐
+  │   │
+  │   └─[Step 7] 시각화 점수 계산
+  │       
+  │       target = is_dynamic ? (speed_p / max_vel_for_scaling) : 0.0;
+  │       dynamic_score = 0.6 * target + 0.4 * dynamic_score;  // 평활화
+  │
+  └─[마무리] 클러스터 모드 후처리 (선택적)
+      
+      if (cluster_mode_) {
+          processDynamicClustersAvg();
+          // 인접한 동적 셀들을 묶어서 속도 평균화
+          // → 사람의 두 발을 하나의 속도로 통합
+      }
+
+
+════════════════════════════════════════════════════════════════════════════════════════════════
+■ 핵심 개선사항 정리
+════════════════════════════════════════════════════════════════════════════════════════════════
+
+[문제 1] 정적인 벽에 계속 파티클 생성 (낭비)
+  해결: generateNewParticles() 5단계에서 정적 & 이웃 없음 → 생성 차단
+  
+[문제 2] 동적→정적 전환이 느림 (0.2초 걸림)
+  해결: need_off_frames를 2→1로 변경 (0.1초로 단축)
+  
+[문제 3] 멈춘 사람이 다시 움직여도 정적 상태로 고착
+  해결: calculateVelocityStatistics() Case 1에서 파티클 없어도 레이다 체크 수행
+  
+[문제 4] 새로운 사람이 나타나도 파티클 생성 안 됨
+  해결: generateNewParticles() 4단계 레이다 체크를 5단계 벽 필터링보다 먼저 수행
+        → radar_active=true이면 벽 체크 건너뛰고 무조건 생성!
+
+[문제 5] 빠르게 움직이는 물체의 파티클이 인접 셀로 이동 (좀비 셀 발생)
+  해결: generateNewParticles() 2단계에서 좀비 셀 감지 및 즉시 복구
+        - dyn_streak 유지, 8개 이상 파티클 생성, 이전 속도 복원
+
+
+════════════════════════════════════════════════════════════════════════════════════════════════
+■ 파라미터 설정 가이드
+════════════════════════════════════════════════════════════════════════════════════════════════
+
+[속도 임계값]
+- particle_static_vel_thresh: 0.2 m/s  (파티클 속도 기준)
+- radar_static_vel_thresh:    0.2 m/s  (레이다 속도 기준)
+  → 두 값을 동일하게 설정하면 일관성 유지
+
+[파티클 비율]
+- max_dynamic_birth_ratio: 0.9 (90% 동적, 10% 정적)
+  → 레이다가 움직임 감지 시 사용
+- max_static_birth_ratio:  0.95 (5% 동적, 95% 정적)
+  → 레이다가 정지 감지 시 사용
+
+[히스테리시스]
+- need_on_frames:  2 (정적→동적: 0.2초)
+  → 깜빡임 방지, 2프레임 유지 권장
+- need_off_frames: 1 (동적→정적: 0.1초) ← 2에서 1로 변경
+  → 빠른 정적 전환, 벽 최적화와 함께 사용
+
+[Winner Mode]
+- particle_vector_vel_thresh: 0.3 m/s  (속도 차이 허용)
+- particle_vector_ang_thresh: 5.0 deg (각도 차이 허용)
+  → 너무 작으면 파편화, 너무 크면 뭉개짐
+
+[클러스터 모드]
+- cluster_mode: true (권장)
+  → 사람의 두 발을 하나의 속도로 통합
+  → 바운딩 박스 + 중심 화살표로 깔끔한 시각화
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

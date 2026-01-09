@@ -234,54 +234,108 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
 {
     // 1. Initialization
     for (auto& cell : grid_) {
-        // cell.is_dynamic = false; 
-        // cell.dyn_streak = 0; cell.stat_streak = 0;
+        // cell.is_dynamic 상태는 초기화하지 않고 유지 (히스테리시스 적용 대상)
+        // cell.dyn_streak, cell.stat_streak도 유지
+        
+        // 동적 점수(시각화용)는 감쇠
         cell.dynamic_score *= 0.85; 
         if (cell.dynamic_score < 0.01) cell.dynamic_score = 0.0;
+        
+        // Free/Occupied Streak 관리
         if (cell.m_free > 0.8) cell.free_streak = std::min<std::uint8_t>(255, cell.free_streak + 1);
         else if (cell.m_occ > 0.6) cell.free_streak = 0;
+        
+        // [중요] 파티클 가중치 합 초기화 (이후 루프에서 다시 계산)
+        cell.total_particle_weight = 0.0f;
     }
 
     auto& parts = particle_filter_->getParticles();
-    const int need_on_frames = 2; const int need_off_frames = 4;
+    
+    // '정적(Static)' -> '동적(Dynamic)' 전환에 필요한 연속 프레임
+    const int need_on_frames = 2; 
+    
+    // '동적(Dynamic)' -> '정적(Static)' 전환에 필요한 연속 정지 프레임 (히스테리시스)
+    const int need_off_frames = 2;
 
+    // 람다 함수: 각 셀별 파티클 통계 처리
     auto flush_cell = [&](int cell_idx, int start, int end) {
         if (cell_idx < 0 || cell_idx >= static_cast<int>(grid_.size())) return;
         auto& c = grid_[cell_idx];
 
-        if (end - start <= 2) {
-            c.stat_streak = std::min<std::uint8_t>(255, c.stat_streak + 1);
-            if (c.stat_streak >= need_off_frames) c.is_dynamic = false;
-            c.dyn_streak = 0; return;
+        double sum_weight = 0.0;
+        for (int j = start; j < end; ++j) {
+            sum_weight += parts[j].weight;
+        }
+        c.total_particle_weight = static_cast<float>(sum_weight);
+
+        // [Case 1] 파티클이 거의 없는 경우 (소멸 혹은 이동함)
+        if (end - start <= 2 || c.total_particle_weight < 1e-6) {
+            // [FIX] 파티클이 없어도 레이다 체크 수행 (정적->동적 전환 허용)
+            // 레이다 속도 체크
+            double max_comp_speed = 0.0;
+            int gx, gy; indexToGrid(cell_idx, gx, gy);
+
+            if (use_radar_) {
+                for (int dy = -radar_hint_search_radius_; dy <= radar_hint_search_radius_; ++dy) {
+                    for (int dx = -radar_hint_search_radius_; dx <= radar_hint_search_radius_; ++dx) {
+                        int nx = gx + dx; int ny = gy + dy;
+                        if (isInside(nx, ny)) {
+                            const auto& neighbor = grid_[gridToIndex(nx, ny)];
+                            double cell_wx, cell_wy;
+                            gridToWorld(nx, ny, cell_wx, cell_wy);
+
+                            for (const auto& hint : neighbor.radar_hints) {
+                                double azimuth = std::atan2(cell_wy - hint.sensor_y, cell_wx - hint.sensor_x);
+                                double abs_vr = std::abs(ego_calib.getAbsoluteRadialVelocity(hint.vr, azimuth));
+                                if (abs_vr > max_comp_speed) {
+                                    max_comp_speed = abs_vr;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            const bool has_speed_from_radar = (max_comp_speed > radar_static_vel_thresh_);
+            double m_unk = std::max(0.0, 1.0 - c.m_occ - c.m_free);
+            const bool is_occupied = (c.m_occ >= c.m_free && c.m_occ >= m_unk);
+            
+            // Streak Update (레이다 기반)
+            if (is_occupied && has_speed_from_radar) {
+                // 레이다가 움직임 감지 -> dyn_streak 증가!
+                c.dyn_streak = std::min<std::uint8_t>(255, c.dyn_streak + 2);
+                c.stat_streak = 0;
+            } else {
+                // 레이다도 정지 확인
+                c.stat_streak = std::min<std::uint8_t>(255, c.stat_streak + 1);
+                c.dyn_streak = 0;
+            }
+            
+            // State Transition
+            if (!c.is_dynamic && c.dyn_streak >= need_on_frames) {
+                c.is_dynamic = true;  // 정적->동적 전환!
+            }
+            if (c.is_dynamic && c.stat_streak >= need_off_frames) {
+                c.is_dynamic = false;  // 동적->정적 전환
+            }
+            
+            return;
         }
 
+        // [Case 2] 파티클이 존재하는 경우 -> 속도 통계 계산
+        
         // --- [Cell-Level Winner Mode] ---
         // 1. Find Winner in Cell
         double max_weight = -1.0;
         int winner_idx = start;
-        double max_confidence = 0.0; // Track winner's confidence
         for (int j = start; j < end; ++j) {
             if (parts[j].weight > max_weight) {
                 max_weight = parts[j].weight;
                 winner_idx = j;
-                max_confidence = parts[j].confidence;
             }
         }
         
-        // [NEW] Low-confidence winner → Skip dynamic judgment
-        // This prevents immature particles from causing false dynamics
-        const double MIN_CONFIDENCE_FOR_DYNAMIC = 0.5;
-        if (max_confidence < MIN_CONFIDENCE_FOR_DYNAMIC) {
-            // Treat as static until confidence builds up
-            c.stat_streak = std::min<std::uint8_t>(255, c.stat_streak + 1);
-            if (c.stat_streak >= need_off_frames) {
-                c.is_dynamic = false;
-            }
-            c.dyn_streak = 0;
-            return;
-        }
-        
-        // 2. Sector Gating (Vel 0.1, Ang 60.0)
+        // 2. Sector Gating (Vel 0.1, Ang 60.0 등 설정값 기반)
         double mode_vx_sum = 0.0;
         double mode_vy_sum = 0.0;
         double mode_w_sum = 0.0;
@@ -298,6 +352,7 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
         }
 
         if (mode_w_sum <= 1e-9) {
+            // 유효한 벡터 합이 없으면 정적으로 간주
             c.stat_streak = std::min<std::uint8_t>(255, c.stat_streak + 1);
             if (c.stat_streak >= need_off_frames) c.is_dynamic = false;
             c.dyn_streak = 0; return;
@@ -316,6 +371,7 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
         const bool is_occupied = (c.m_occ >= c.m_free && c.m_occ >= m_unk);
         const bool has_speed_from_particles = (speed_p > particle_static_vel_thresh_);
 
+        // 레이다 보정 (Radar Confirmation)
         double max_comp_speed = 0.0;
         int gx, gy; indexToGrid(cell_idx, gx, gy);
 
@@ -342,8 +398,11 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
         
         const bool has_speed_from_radar = (max_comp_speed > radar_static_vel_thresh_);
         bool dyn_candidate = false;
+        
         if (use_radar_) {
             dyn_candidate = is_occupied && (has_speed_from_particles || has_speed_from_radar);
+            
+            // FSD (False Static Detection): 정지해 보이지만 실제로는 움직이는 물체 보정
             bool is_currently_static = is_occupied && !dyn_candidate;
             if (use_fsd_ && is_currently_static && c.stat_streak >= fsd_T_static_ && c.free_streak >= fsd_T_free_) { 
                 dyn_candidate = true; c.free_streak = 0; 
@@ -352,6 +411,7 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
             dyn_candidate = is_occupied && has_speed_from_particles;
         }
 
+        // Streak Update
         if (dyn_candidate) {
             int streak_increase = (has_speed_from_radar) ? 2 : 1;
             c.dyn_streak  = std::min<std::uint8_t>(255, c.dyn_streak + streak_increase);
@@ -361,14 +421,17 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
             c.dyn_streak  = 0;
         }
 
+        // State Transition
         if (!c.is_dynamic && c.dyn_streak >= need_on_frames) c.is_dynamic = true;
         if ( c.is_dynamic && c.stat_streak >= need_off_frames) c.is_dynamic = false;
 
+        // Dynamic Score for Visualization
         const double target = c.is_dynamic ? std::min(1.0, speed_p / std::max(1e-6, max_vel_for_scaling)) : 0.0;
         const double alpha  = 0.6;
         c.dynamic_score = alpha * target + (1.0 - alpha) * c.dynamic_score;
     }; 
 
+    // 파티클 순회 및 통계 처리 (정렬된 파티클 리스트 가정)
     int current_idx = -1; int first_i = 0;
     for (int i = 0; i <= static_cast<int>(parts.size()); ++i) {
         bool last = (i == static_cast<int>(parts.size()));
@@ -381,7 +444,7 @@ void DynamicGridMap::calculateVelocityStatistics(double max_vel_for_scaling,
         }
     }
 
-    // [New] Execute Cluster-based Processing if enabled
+    // 클러스터 모드 후처리
     if (cluster_mode_) {
         processDynamicClustersAvg(ego_calib);
     }
@@ -603,149 +666,23 @@ void DynamicGridMap::processDynamicClusters(const EgoCalibration& ego_calib) {
 }
 #endif
 
-// void DynamicGridMap::processDynamicClusters(const EgoCalibration& ego_calib) {
-//     auto& parts = particle_filter_->getParticles();
-    
-//     // 1. [Efficiency] 파티클 검색 최적화를 위한 맵핑 (Cell Index -> Particle Range)
-//     // 전체 파티클을 매번 탐색하면 연산량이 많으므로, 각 셀별 파티클 구간을 미리 저장
-//     std::vector<std::pair<int, int>> cell_particle_ranges(grid_.size(), {-1, -1});
-//     int current_cell = -1;
-//     int start_p = 0;
-    
-//     // parts 벡터는 grid_cell_idx 순으로 정렬되어 있다고 가정
-//     for (int i = 0; i <= static_cast<int>(parts.size()); ++i) {
-//         bool last = (i == static_cast<int>(parts.size()));
-//         int c_idx = last ? -1 : parts[i].grid_cell_idx;
-//         if (last || c_idx != current_cell) {
-//             if (current_cell >= 0 && current_cell < static_cast<int>(grid_.size())) {
-//                 cell_particle_ranges[current_cell] = {start_p, i};
-//             }
-//             current_cell = c_idx;
-//             start_p = i;
-//         }
-//     }
-
-//     // 2. BFS Clustering (2칸 반경으로 병합 - 두 발을 하나로 묶기 위함)
-//     std::vector<bool> visited(grid_.size(), false);
-    
-//     // [수정 포인트 1] 클러스터링 반경을 2칸(Chebyshev distance 2)으로 설정
-//     const int cluster_search_radius = 2; 
-
-//     for (int i = 0; i < grid_.size(); ++i) {
-//         // 이미 처리했거나 동적이 아닌 셀은 패스
-//         if (visited[i] || !grid_[i].is_dynamic) continue;
-        
-//         std::vector<int> cluster_indices;
-//         std::queue<int> q;
-//         q.push(i);
-//         visited[i] = true;
-        
-//         // --- BFS 탐색 시작 ---
-//         while (!q.empty()) {
-//             int curr = q.front(); q.pop();
-//             cluster_indices.push_back(curr);
-//             int gx, gy; indexToGrid(curr, gx, gy);
-            
-//             // 2칸 반경 이웃 탐색
-//             for (int dy = -cluster_search_radius; dy <= cluster_search_radius; ++dy) {
-//                 for (int dx = -cluster_search_radius; dx <= cluster_search_radius; ++dx) {
-//                     if (dx == 0 && dy == 0) continue;
-//                     int nx = gx + dx; int ny = gy + dy;
-//                     if (isInside(nx, ny)) {
-//                         int nidx = gridToIndex(nx, ny);
-//                         // 방문 안 했고, 동적 셀(is_dynamic)인 경우만 병합
-//                         if (!visited[nidx] && grid_[nidx].is_dynamic) {
-//                             visited[nidx] = true;
-//                             q.push(nidx);
-//                         }
-//                     }
-//                 }
-//             }
-//         }
-        
-//         if (cluster_indices.empty()) continue;
-
-//         // 3. [수정 포인트 2] "Global Winner" 찾기 (클러스터 전체 파티클 대상)
-//         double global_max_weight = -1.0;
-//         int global_winner_idx = -1;
-
-//         // 클러스터에 속한 모든 셀을 뒤져서 최고 가중치 파티클을 찾음
-//         for (int c_idx : cluster_indices) {
-//             std::pair<int, int> range = cell_particle_ranges[c_idx];
-//             if (range.first == -1) continue; // 파티클 없는 셀은 패스
-
-//             for (int p = range.first; p < range.second; ++p) {
-//                 if (parts[p].weight > global_max_weight) {
-//                     global_max_weight = parts[p].weight;
-//                     global_winner_idx = p;
-//                 }
-//             }
-//         }
-
-//         // 유효한 파티클이 하나도 없으면 스킵
-//         if (global_winner_idx == -1) continue; 
-
-//         // 4. [수정 포인트 3] Global Winner 기준으로 가중 평균 (Re-Gating)
-//         const Particle& winner = parts[global_winner_idx];
-//         double cluster_vx_sum = 0.0;
-//         double cluster_vy_sum = 0.0;
-//         double cluster_w_sum = 0.0;
-
-//         for (int c_idx : cluster_indices) {
-//             std::pair<int, int> range = cell_particle_ranges[c_idx];
-//             if (range.first == -1) continue;
-
-//             for (int p = range.first; p < range.second; ++p) {
-//                 // 검증: 이 파티클이 Winner(대장)와 속도/방향이 비슷한가?
-//                 // 비슷하지 않다면(노이즈라면) 과감히 합산에서 제외됨 (Internal Noise Filtering 효과)
-//                 if (particle_filter_->checkSectorMatch(winner, parts[p], 
-//                                                        particle_vector_vel_thresh_, 
-//                                                        particle_vector_ang_thresh_)) 
-//                 {
-//                     cluster_vx_sum += parts[p].vx * parts[p].weight;
-//                     cluster_vy_sum += parts[p].vy * parts[p].weight;
-//                     cluster_w_sum  += parts[p].weight;
-//                 }
-//             }
-//         }
-
-//         // 5. 최종 결과 적용
-//         if (cluster_w_sum > 1e-9) {
-//             double final_vx = cluster_vx_sum / cluster_w_sum;
-//             double final_vy = cluster_vy_sum / cluster_w_sum;
-
-//             // 계산된 "정제된 속도"를 클러스터 내 모든 셀에 일괄 적용 (Object Consistency)
-//             for (int c_idx : cluster_indices) {
-//                 grid_[c_idx].mean_vx = final_vx;
-//                 grid_[c_idx].mean_vy = final_vy;
-//             }
-//         }
-//     }
-// }
-
-
 std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_stddev,
-                                               double min_dynamic_birth_ratio,
                                                double max_dynamic_birth_ratio,
-                                               double max_radar_speed_for_scaling,
+                                               double max_static_birth_ratio,
                                                double dynamic_newborn_vel_stddev,
                                                const EgoCalibration& ego_calib)
 {
     std::vector<Particle> new_particles;
     
-    // 1. Ego Motion 보정용 정적 속도 가져오기
+    // 1. 분포 및 속도 설정
     double static_vx, static_vy;
     ego_calib.getStaticParticleVelocity(static_vx, static_vy);
-    
-    // 2. 속도 분포 설정 (기존 로직 유지)
-    std::normal_distribution<double> static_vel_dist_x(static_vx, newborn_vel_stddev);
-    std::normal_distribution<double> static_vel_dist_y(static_vy, newborn_vel_stddev);
-    // 동적 파티클은 방향성 없이 랜덤하게 퍼짐 (Zero Mean + Large Stddev)
-    std::normal_distribution<double> dynamic_fallback_dist(0.0, dynamic_newborn_vel_stddev);
 
-    // [수정 핵심] 위치 랜덤 분포 추가 (Uniform Distribution)
-    // 파티클 생성 위치를 셀 중심에서 셀 크기(resolution) 전체 영역으로 확장
-    // 범위: [-resolution_/2.0, +resolution_/2.0]
+    // 정적 파티클용 미세 노이즈
+    std::normal_distribution<double> static_noise_x(static_vx, 0.05);
+    std::normal_distribution<double> static_noise_y(static_vy, 0.05);
+    
+    // 위치 노이즈
     std::uniform_real_distribution<double> pos_dist(-resolution_ / 2.0, resolution_ / 2.0);
 
     for (int y = 0; y < grid_height_; ++y) {
@@ -753,87 +690,188 @@ std::vector<Particle> DynamicGridMap::generateNewParticles(double newborn_vel_st
             int idx = gridToIndex(x, y);
             const auto& cell = grid_[idx];
 
-            // 탄생(Birth) 조건: 확률 질량(rho_b)이 충분하고 점유된 셀일 때
+            // =========================================================
+            // [1단계: 진입 판정] (Entry Gate)
+            // =========================================================
             if (cell.rho_b > 0.5 && cell.m_occ > 0.6) {
-                // [NEW] 이미 동적으로 추적 중인 셀이면 새 파티클 생성 안 함
-                // 이유: is_dynamic = true는 이미 파티클이 해당 영역을 추적 중이라는 의미
-                if (cell.is_dynamic) {
-                    continue;  // 건너뛰기
+                
+                // =========================================================
+                // [2단계: 좀비 셀(Zombie Cell) 감지 및 우선 복구]
+                // =========================================================
+                // 좀비 셀: is_dynamic=true인데 파티클이 거의 없는 상태
+                // → calculateVelocityStatistics에서 2프레임 내 정리되지만, 그 사이 발견 시 즉시 복구
+                const bool is_zombie_cell = (cell.is_dynamic && cell.total_particle_weight < 0.05f);
+                
+                // [FIX] 레이다 변수를 블록 전체에서 사용 가능하도록 미리 선언
+                bool radar_active = false;
+                double max_radar_speed = 0.0;
+                
+                if (is_zombie_cell) {
+                    // [FIX] 좀비 셀 복구: dyn_streak만 유지, stat_streak는 건드리지 않음!
+                    // → 정적으로 전환되는 과정을 방해하지 않음 (stat_streak은 calculateVelocityStatistics에서 관리)
+                    auto& mutable_cell = grid_[idx];
+                    mutable_cell.dyn_streak = std::max<std::uint8_t>(2, mutable_cell.dyn_streak);
+                    // 좀비 셀은 무조건 복구 (이웃 체크 생략, 즉시 생성 단계로)
                 }
-                
-                int num_to_birth = static_cast<int>(std::ceil(cell.rho_b * 4.0));
-                
-                // [Radar Hint 로직] - 여기서는 동적 파티클 비율 계산에만 사용 (기존 유지)
-                double max_comp_speed = 0.0;
-                if (use_radar_) {
-                    for (int dy = -radar_hint_search_radius_; dy <= radar_hint_search_radius_; ++dy) {
-                        for (int dx = -radar_hint_search_radius_; dx <= radar_hint_search_radius_; ++dx) {
-                            int nx = x + dx; int ny = y + dy;
-                            if (isInside(nx, ny)) {
-                                const auto& neighbor = grid_[gridToIndex(nx, ny)];
-                                double cell_wx, cell_wy;
-                                gridToWorld(nx, ny, cell_wx, cell_wy);
-                                for (const auto& hint : neighbor.radar_hints) {
-                                    double azimuth = std::atan2(cell_wy - hint.sensor_y, cell_wx - hint.sensor_x);
-                                    double abs_vr = std::abs(ego_calib.getAbsoluteRadialVelocity(hint.vr, azimuth));
-                                    if (abs_vr > max_comp_speed) max_comp_speed = abs_vr;
+                else {
+                    // =========================================================
+                    // [3단계: 일반 셀 - 파티클 충분 여부 확인]
+                    // =========================================================
+                    if (cell.total_particle_weight > 0.05f) continue; // 파티클 충분, 생성 불필요
+                    
+                    // =========================================================
+                    // [4단계: 레이다 속도 확인] (먼저 체크!)
+                    // =========================================================
+                    // [FIX] 레이다 체크를 이웃 체크보다 먼저 수행하여 새로운 동적 물체 감지
+                    if (use_radar_) {
+                        for (int dy = -radar_hint_search_radius_; dy <= radar_hint_search_radius_; ++dy) {
+                            for (int dx = -radar_hint_search_radius_; dx <= radar_hint_search_radius_; ++dx) {
+                                int nx = x + dx; int ny = y + dy;
+                                if (isInside(nx, ny)) {
+                                    const auto& neighbor = grid_[gridToIndex(nx, ny)];
+                                    for (const auto& hint : neighbor.radar_hints) {
+                                         double cell_wx, cell_wy;
+                                         gridToWorld(nx, ny, cell_wx, cell_wy);
+                                         double azimuth = std::atan2(cell_wy - hint.sensor_y, cell_wx - hint.sensor_x);
+                                         double abs_vr = std::abs(ego_calib.getAbsoluteRadialVelocity(hint.vr, azimuth));
+                                         if (abs_vr > max_radar_speed) max_radar_speed = abs_vr;
+                                    }
                                 }
                             }
+                        }
+                        if (max_radar_speed > radar_static_vel_thresh_) {
+                            radar_active = true;
+                        }
+                    }
+                    
+                    // =========================================================
+                    // [5단계: 정적 셀 & 이웃 체크 (벽 필터링)]
+                    // =========================================================
+                    // [FIX] 레이다가 감지한 경우는 벽 체크를 건너뛰고 무조건 생성
+                    if (!radar_active) {
+                        // 레이다 감지 없을 때만 벽 필터링 수행
+                        // 정적이면서(is_dynamic=false) 동시에 이웃에도 동적 셀이 없으면 생성 차단
+                        // → 진짜 벽: 정적 + 이웃 없음 + 레이다 없음 → 차단 (반복 생성 방지)
+                        // → 새로운 사람: 정적 + 이웃 없음 + 레이다 있음 → 생성! (복구)
+                        
+                        bool is_neighbor_dynamic = false;
+                        int neighbor_check_radius = 2;
+
+                        for (int dy = -neighbor_check_radius; dy <= neighbor_check_radius; ++dy) {
+                            for (int dx = -neighbor_check_radius; dx <= neighbor_check_radius; ++dx) {
+                                if (dx == 0 && dy == 0) continue;
+                                int nx = x + dx; int ny = y + dy;
+                                if (isInside(nx, ny)) {
+                                    const auto& neighbor = grid_[gridToIndex(nx, ny)];
+                                    // 이웃이 동적이고 파티클도 있으면 확산 가능
+                                    if (neighbor.is_dynamic && neighbor.total_particle_weight > 0.05f) {
+                                        is_neighbor_dynamic = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (is_neighbor_dynamic) break;
+                        }
+
+                        // [핵심 로직] 정적 AND 이웃 없음 = 진짜 벽 → 생성 차단
+                        if (!cell.is_dynamic && !is_neighbor_dynamic) {
+                            continue; // 벽으로 확정, 생성 안 함
                         }
                     }
                 }
 
-                // 동적 파티클 비율 결정
-                double current_dynamic_ratio = min_dynamic_birth_ratio;
-                if (max_comp_speed > 1e-6) {
-                    double scale = std::min(1.0, max_comp_speed / std::max(1e-6, max_radar_speed_for_scaling));
-                    current_dynamic_ratio = min_dynamic_birth_ratio + (max_dynamic_birth_ratio - min_dynamic_birth_ratio) * scale;
+                // =========================================================
+                // [6단계: 최종 생성] (Spawn Strategy)
+                // =========================================================
+
+                int num_to_birth = static_cast<int>(std::ceil(cell.rho_b * 4.0));
+                
+                // [FIX] 좀비 셀 복구 시 파티클 부족 방지: 최소 개수 보장
+                if (is_zombie_cell) {
+                    // 좀비 복구 시 더 많은 파티클로 빠른 복구
+                    num_to_birth = std::max(num_to_birth, 8);
+                } else {
+                    // 일반 탄생 시 최소값
+                    if (num_to_birth < 5) num_to_birth = 5;
                 }
 
-                int num_dynamic = static_cast<int>(num_to_birth * current_dynamic_ratio);
-                int num_static = num_to_birth - num_dynamic;
+                int num_dynamic = 0;
+                int num_static = 0;
 
-                // 3. 정적 파티클 생성 (Static Particles)
+                // [FIX] 좀비 셀 우선 처리: is_dynamic=true이므로 동적 파티클 위주로 생성
+                if (is_zombie_cell) {
+                    // 좀비 셀 복구: YAML의 max_dynamic_birth_ratio 사용 (예: 0.9 = 90% 동적)
+                    num_dynamic = static_cast<int>(num_to_birth * max_dynamic_birth_ratio);
+                    num_static  = num_to_birth - num_dynamic;
+                }
+                else if (radar_active) {
+                    // 레이다 속도 > threshold: YAML의 max_dynamic_birth_ratio 사용 (예: 0.9 = 90% 동적)
+                    num_dynamic = static_cast<int>(num_to_birth * max_dynamic_birth_ratio);
+                    num_static  = num_to_birth - num_dynamic;
+                } 
+                else {
+                    // 레이다 속도 <= threshold: YAML의 max_static_birth_ratio 사용 (예: 0.8 = 80% 정적)
+                    num_static  = static_cast<int>(num_to_birth * max_static_birth_ratio);
+                    num_dynamic = num_to_birth - num_static;
+                }
+
+                // 1. 정적 파티클 생성 (Static)
                 for (int i = 0; i < num_static; ++i) {
                     Particle p;
-                    gridToWorld(x, y, p.x, p.y); // 셀 중심 좌표 할당
-                    
-                    // [적용] 위치 랜덤 노이즈 추가 -> 셀 전체 영역에 분포
+                    gridToWorld(x, y, p.x, p.y); 
                     p.x += pos_dist(random_generator_);
                     p.y += pos_dist(random_generator_);
                     
-                    p.vx = static_vel_dist_x(random_generator_);
-                    p.vy = static_vel_dist_y(random_generator_);
-                    p.weight = cell.rho_b / static_cast<double>(num_to_birth);
+                    p.vx = static_noise_x(random_generator_);
+                    p.vy = static_noise_y(random_generator_);
+                    
+                    p.weight = cell.rho_b / num_to_birth;
                     p.grid_cell_idx = idx; p.age = 0;
-                    // [NEW] Initial confidence based on occupancy stability
-                    p.vx = static_vel_dist_x(random_generator_);
-                    p.vy = static_vel_dist_y(random_generator_);
-                    p.weight = cell.rho_b / static_cast<double>(num_to_birth);
-                    p.grid_cell_idx = idx; p.age = 0;
-                    // [NEW] Initial confidence based on occupancy stability
-                    p.confidence = cell.occ_stability;
                     new_particles.push_back(p);
                 }
 
-                // 4. 동적 파티클 생성 (Dynamic Particles)
-                for (int i = 0; i < num_dynamic; ++i) {
-                    Particle p;
-                    gridToWorld(x, y, p.x, p.y); // 셀 중심 좌표 할당
-                    
-                    // [적용] 위치 랜덤 노이즈 추가 -> 셀 전체 영역에 분포 (탈출 확률 확보)
-                    p.x += pos_dist(random_generator_);
-                    p.y += pos_dist(random_generator_);
+                // 2. 동적 파티클 생성 (Dynamic - Random or Radar Guided)
+                if (num_dynamic > 0) {
+                    std::normal_distribution<double> dyn_vel_dist(0.0, dynamic_newborn_vel_stddev);
+                    std::normal_distribution<double> rand_dir(0.0, 1.0);
 
-                    // 속도는 기존과 동일하게 랜덤 분포 사용 (방향성 없음)
-                    p.vx = dynamic_fallback_dist(random_generator_) + static_vx; 
-                    p.vy = dynamic_fallback_dist(random_generator_) + static_vy; 
-                    
-                    p.weight = cell.rho_b / static_cast<double>(num_to_birth);
-                    p.grid_cell_idx = idx; p.age = 0;
-                    // [NEW] Dynamic particles start with lower confidence
-                    p.confidence = cell.occ_stability * 0.5;
-                    new_particles.push_back(p);
+                    for (int i = 0; i < num_dynamic; ++i) {
+                        Particle p;
+                        gridToWorld(x, y, p.x, p.y);
+                        p.x += pos_dist(random_generator_);
+                        p.y += pos_dist(random_generator_);
+
+                        // [FIX] 좀비 복구 시 이전 속도 복원 시도
+                        if (is_zombie_cell) {
+                            // 좀비 셀의 이전 속도(cell.mean_vx/vy) 활용
+                            double prev_speed = std::sqrt(cell.mean_vx*cell.mean_vx + cell.mean_vy*cell.mean_vy);
+                            if (prev_speed > 0.1) {
+                                // 이전 속도가 유효하면 그 방향으로 복원 (노이즈 추가)
+                                p.vx = cell.mean_vx + dyn_vel_dist(random_generator_);
+                                p.vy = cell.mean_vy + dyn_vel_dist(random_generator_);
+                            } else {
+                                // 이전 속도가 없으면 랜덤 탐색
+                                double dx = rand_dir(random_generator_);
+                                double dy = rand_dir(random_generator_);
+                                double mag = std::sqrt(dx*dx + dy*dy);
+                                double target_speed = (radar_active) ? max_radar_speed : 1.0;
+                                p.vx = (dx / mag) * target_speed + dyn_vel_dist(random_generator_);
+                                p.vy = (dy / mag) * target_speed + dyn_vel_dist(random_generator_);
+                            }
+                        } else {
+                            // 일반 동적 파티클 생성 (기존 로직)
+                            double dx = rand_dir(random_generator_);
+                            double dy = rand_dir(random_generator_);
+                            double mag = std::sqrt(dx*dx + dy*dy);
+                            double target_speed = (radar_active) ? max_radar_speed : 1.0;
+                            p.vx = (dx / mag) * target_speed + dyn_vel_dist(random_generator_);
+                            p.vy = (dy / mag) * target_speed + dyn_vel_dist(random_generator_);
+                        }
+                        
+                        p.weight = cell.rho_b / num_to_birth;
+                        p.grid_cell_idx = idx; p.age = 0;
+                        new_particles.push_back(p);
+                    }
                 }
             }
         }
@@ -960,8 +998,8 @@ void DynamicGridMap::toMarkerArrayMsg(visualization_msgs::MarkerArray& arr,
         arrow_template.scale.x = 0.04; // Shaft diameter (ONE_ARROW=0과 동일)
         arrow_template.scale.y = 0.06;  // Head diameter (ONE_ARROW=0과 동일)
         arrow_template.scale.z = 0.06;  // Head length (ONE_ARROW=0과 동일)
-        arrow_template.color.r = 1.0; arrow_template.color.g = 1.0; arrow_template.color.b = 0.0; arrow_template.color.a = 1.0;
-        arrow_template.lifetime = ros::Duration(0.4);
+        arrow_template.color.r = 0.0; arrow_template.color.g = 1.0; arrow_template.color.b = 0.0; arrow_template.color.a = 1.0;
+        arrow_template.lifetime = ros::Duration(0.2);
 
         int arrow_id = 10;
         
@@ -1138,65 +1176,78 @@ void DynamicGridMap::allParticlesToMarkerMsg(visualization_msgs::Marker& marker,
     marker.type = visualization_msgs::Marker::LINE_LIST;
     marker.action = visualization_msgs::Marker::ADD;
     marker.pose.orientation.w = 1.0;
+    marker.scale.x = 0.005; // 선 두께
 
-    // 화살표 선 두께 (0.005m = 5mm)
-    marker.scale.x = 0.005; 
-
-    // 초록색 설정 (요청사항)
-    marker.color.r = 0.0f;
-    marker.color.g = 1.0f;
-    marker.color.b = 0.0f;
-    marker.color.a = 0.6f;
+    // [중요] 전역 색상은 무시하고, 점마다 색상을 따로 지정하기 위해 비워둡니다.
+    // (marker.color 설정 삭제 또는 무시됨)
 
     marker.lifetime = ros::Duration(0.1);
 
     const auto& particles = particle_filter_->getParticles();
-    const double shaft_scale = 0.15; // 몸통 길이 배율
-    const double head_len = 0.04;    // 화살표 머리 날개 길이
-    const double cos30 = 0.866, sin30 = 0.5; // 30도 회전용 상수
+    const double shaft_scale = 0.15;
+    const double head_len = 0.04;
+    const double cos30 = 0.866, sin30 = 0.5;
 
-    // 화살표 하나당 3개의 선(점 6개)이 필요함
-    marker.points.reserve(particles.size() * 6);
+    marker.points.clear();
+    marker.colors.clear(); // 점별 색상 배열 초기화
 
     for (const auto& p : particles) {
         double vx = p.vx;
         double vy = p.vy;
         double speed = std::sqrt(vx * vx + vy * vy);
 
-        // 1. 몸통 (Shaft) 시작점과 끝점 계산
-        geometry_msgs::Point p_start, p_end;
-        p_start.x = p.x;
-        p_start.y = p.y;
-        p_start.z = 0.1; // 격자 위로 약간 띄움
+        // --- [색상 결정 로직] ---
+        std_msgs::ColorRGBA p_color;
+        p_color.a = 0.6; // 투명도
 
-        p_end.x = p.x + vx * shaft_scale;
-        p_end.y = p.y + vy * shaft_scale;
-        p_end.z = 0.1;
+        // 속도 0.25 m/s 기준 (박사님 설정값 참고)
+        if (speed < 0.25) {
+            // 정적(Static): 파란색
+            p_color.r = 0.0; p_color.g = 0.0; p_color.b = 1.0;
+        } else {
+            // 동적(Dynamic): 빨간색
+            p_color.r = 1.0; p_color.g = 0.0; p_color.b = 0.0;
+        }
+        // -----------------------
+
+        // 1. 몸통 (Shaft)
+        geometry_msgs::Point p_start, p_end;
+        p_start.x = p.x; p_start.y = p.y; p_start.z = 0.1;
+        p_end.x = p.x + vx * shaft_scale; p_end.y = p.y + vy * shaft_scale; p_end.z = 0.1;
         
+        // 점 2개 추가 (선 하나)
         marker.points.push_back(p_start);
         marker.points.push_back(p_end);
+        
+        // 색상 2개 추가 (점 개수와 맞춰야 함)
+        marker.colors.push_back(p_color);
+        marker.colors.push_back(p_color);
 
-        // 속도가 너무 작으면 머리는 그리지 않음
         if (speed > 0.1) {
-            // 역방향 단위 벡터 계산
             double ux = -vx / speed * head_len;
             double uy = -vy / speed * head_len;
 
-            // 2. 머리 날개 1 (Left Wing)
+            // 2. 왼쪽 날개
             geometry_msgs::Point h1;
             h1.x = p_end.x + (ux * cos30 - uy * sin30);
             h1.y = p_end.y + (ux * sin30 + uy * cos30);
             h1.z = 0.1;
+            
             marker.points.push_back(p_end);
             marker.points.push_back(h1);
+            marker.colors.push_back(p_color);
+            marker.colors.push_back(p_color);
 
-            // 3. 머리 날개 2 (Right Wing)
+            // 3. 오른쪽 날개
             geometry_msgs::Point h2;
             h2.x = p_end.x + (ux * cos30 + uy * sin30);
             h2.y = p_end.y + (-ux * sin30 + uy * cos30);
             h2.z = 0.1;
+            
             marker.points.push_back(p_end);
             marker.points.push_back(h2);
+            marker.colors.push_back(p_color);
+            marker.colors.push_back(p_color);
         }
     }
 }

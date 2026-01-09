@@ -67,14 +67,6 @@ void ParticleFilter::predict(double dt, double survival_prob,
 
         p.weight *= survival_prob;
         p.age++;
-        
-        // [NEW] Gradually increase confidence as particle survives
-        // Confidence saturates at 1.0 after ~10 frames
-        if (p.weight > 1e-9) { // Only increase if particle is alive
-            p.confidence = std::min(1.0, p.confidence + 0.1);
-        } else {
-            p.confidence *= 0.5; // Decay confidence for dying particles
-        }
     }
 }
 
@@ -149,11 +141,21 @@ void ParticleFilter::updateWeights(const std::vector<MeasurementCell>& measureme
                                 if (std::abs(hint.vr) < 0.1) continue;
 
                                 // B. Expected Radial Velocity Calculation
-                                // Radar measures velocity component along sensor's forward direction (local X-axis)
-                                // The sensor direction is defined by sensor_yaw (rotation around Z-axis)
-                                // Formula: vr_exp = velocity · sensor_direction
-                                //                 = vx * cos(sensor_yaw) + vy * sin(sensor_yaw)
-                                double vr_expected = p.vx * hint.sensor_cos_yaw + p.vy * hint.sensor_sin_yaw;
+                                // Radar measures velocity along the sensor→object direction (radial direction)
+                                // NOT just the sensor's forward direction!
+                                // 1. Calculate sensor→particle direction vector
+                                double dx = p.x - hint.sensor_x;
+                                double dy = p.y - hint.sensor_y;
+                                double range = std::sqrt(dx*dx + dy*dy);
+                                if (range < 1e-6) continue; // Skip if particle is at sensor position
+                                
+                                // 2. Normalize to get unit direction vector
+                                double dir_x = dx / range;
+                                double dir_y = dy / range;
+                                
+                                // 3. Project particle velocity onto radial direction
+                                // Formula: vr_expected = velocity · radial_direction
+                                double vr_expected = p.vx * dir_x + p.vy * dir_y;
                                 
                                 // C. Probability Calculation
                                 double error = vr_expected - hint.vr;

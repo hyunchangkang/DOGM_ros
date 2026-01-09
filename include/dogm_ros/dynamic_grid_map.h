@@ -49,9 +49,8 @@ public:
     void shiftGrid(double dx, double dy);
 
     std::vector<Particle> generateNewParticles(double newborn_vel_stddev,
-                                               double min_dynamic_birth_ratio,
                                                double max_dynamic_birth_ratio,
-                                               double max_radar_speed_for_scaling,
+                                               double max_static_birth_ratio,
                                                double dynamic_newborn_vel_stddev,
                                                const EgoCalibration& ego_calib);
 

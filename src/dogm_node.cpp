@@ -209,14 +209,18 @@ private:
         grid_map_->calculateVelocityStatistics(max_vel_for_scaling_, use_ego_comp_, ego_calib_);
         
         // 8. Generate new particles at birth cells and perform Resampling
-        auto new_borns = grid_map_->generateNewParticles(
-            newborn_vel_stddev_, min_dynamic_birth_ratio_, max_dynamic_birth_ratio_,
-            max_radar_speed_for_scaling_, dynamic_newborn_vel_stddev_, ego_calib_
+        auto new_borns = grid_map_->generateNewParticles
+        (
+            newborn_vel_stddev_, 
+            max_dynamic_birth_ratio_,
+            max_static_birth_ratio_,
+            dynamic_newborn_vel_stddev_, 
+            ego_calib_
         );
         
         pf.resample(new_borns);
 
-        // [Added] Publish all raw particles to RViz for monitoring
+        // Publish all raw particles for monitoring
         visualization_msgs::Marker all_p_marker;
         grid_map_->allParticlesToMarkerMsg(all_p_marker, base_frame_);
         all_particle_pub_.publish(all_p_marker);
@@ -233,12 +237,11 @@ private:
         has_scan_ = false;
     }
 
-    /**
-     * @brief Load filter and node parameters from ROS parameter server
-     */
-    void loadParams() {
-        // [Added] Topic name for all particles visualization
-        pnh_.param("all_particle_marker_topic", all_particle_marker_topic_, std::string("/dogm/all_particles"));
+/**
+ * @brief Load filter and node parameters from ROS parameter server
+ */
+void loadParams() {
+    pnh_.param("all_particle_marker_topic", all_particle_marker_topic_, std::string("/dogm/all_particles"));
 
         pnh_.param("use_radar", use_radar_, true);
         pnh_.param("lidar_topic", lidar_topic_, std::string("/scan"));
@@ -272,9 +275,8 @@ private:
         pnh_.param("radar_buffer_size", radar_buffer_size_, 5);
         pnh_.param("min_radar_points", min_radar_points_, 2);
         pnh_.param("radar_hint_search_radius", radar_hint_search_radius_, 2); 
-        pnh_.param("min_dynamic_birth_ratio", min_dynamic_birth_ratio_, 0.1);
         pnh_.param("max_dynamic_birth_ratio", max_dynamic_birth_ratio_, 0.9);
-        pnh_.param("max_radar_speed_for_scaling", max_radar_speed_for_scaling_, 1.0);
+        pnh_.param("max_static_birth_ratio", max_static_birth_ratio_, 0.8);
         pnh_.param("radar_noise_stddev", radar_noise_stddev_, 0.25);
         pnh_.param("use_false_static_detection", use_fsd_, true);
         pnh_.param("fsd_T_static", fsd_T_static_, 4);
@@ -297,7 +299,7 @@ private:
     ros::Subscriber scan_sub_, odom_sub_;
     ros::Subscriber radar_sub_1_, radar_sub_2_;
     ros::Publisher  grid_pub_, marker_pub_, ego_vel_pub_;
-    ros::Publisher  all_particle_pub_; // [Added]
+    ros::Publisher  all_particle_pub_;
     ros::Timer      timer_;
     
     std::unique_ptr<DynamicGridMap> grid_map_;
@@ -314,13 +316,13 @@ private:
     std::string lidar_topic_, grid_topic_, marker_topic_, base_frame_, odom_topic_;
     std::string radar_topic_1_, radar_topic_2_;
     std::string radar_frame_1_, radar_frame_2_;
-    std::string all_particle_marker_topic_; // [Added]
+    std::string all_particle_marker_topic_;
 
     double grid_size_, grid_res_, filter_hz_, persistence_prob_, birth_prob_;
     int num_particles_;
     double process_noise_pos_, process_noise_vel_, max_velocity_, newborn_vel_stddev_;
-    double min_dynamic_birth_ratio_, max_dynamic_birth_ratio_;
-    double max_radar_speed_for_scaling_;
+    double max_dynamic_birth_ratio_;
+    double max_static_birth_ratio_;
     double dynamic_newborn_vel_stddev_;
     double velocity_damping_threshold_, velocity_damping_factor_;
     double max_vel_for_scaling_;
